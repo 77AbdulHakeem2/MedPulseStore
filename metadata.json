@@ -1,0 +1,6 @@
+{
+  "name": "متجر رَقْم — نظام إدارة متجر تيليجرام للمنتجات الرقمية",
+  "description": "نظام تجاري متكامل لإدارة متجر اشتراكات ومنتجات رقمية عبر تيليجرام مع ربط 5 مزودي API، محرك تسعير دقيق، محافظ مالية، دفع USDT/Binance، ولوحة إدارة عبر تيليجرام والويب.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

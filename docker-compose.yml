@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${SQL_DB_NAME:-digital_store}
+      POSTGRES_USER: ${SQL_ADMIN_USER:-postgres}
+      POSTGRES_PASSWORD: ${SQL_ADMIN_PASSWORD:-change_me_strong_password}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SQL_ADMIN_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redisdata:/data
+
+  store-app:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      SQL_HOST: postgres
+      SQL_DB_NAME: ${SQL_DB_NAME:-digital_store}
+      SQL_USER: ${SQL_ADMIN_USER:-postgres}
+      SQL_PASSWORD: ${SQL_ADMIN_PASSWORD:-change_me_strong_password}
+      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY}
+      SESSION_SIGNING_SECRET: ${SESSION_SIGNING_SECRET}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_WEBHOOK_SECRET: ${TELEGRAM_WEBHOOK_SECRET}
+      TELEGRAM_OWNER_IDS: ${TELEGRAM_OWNER_IDS}
+      BINANCE_PAY_API_KEY: ${BINANCE_PAY_API_KEY}
+      BINANCE_PAY_SECRET_KEY: ${BINANCE_PAY_SECRET_KEY}
+      USDT_RECEIVER_WALLET_TRC20: ${USDT_RECEIVER_WALLET_TRC20}
+      TRONGRID_API_KEY: ${TRONGRID_API_KEY}
+
+volumes:
+  pgdata:
+  redisdata:
