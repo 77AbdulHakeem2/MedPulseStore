@@ -12,8 +12,10 @@ import {
   ExternalLink,
   SlidersHorizontal,
   Terminal,
+  Sparkles,
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
+import TelegramHtmlRenderer from './TelegramHtmlRenderer';
 import {
   FeedbackBanner,
   PageHeader,
@@ -37,6 +39,11 @@ interface LiveTelegramStatus {
   startedAt: string | null;
   updatesReceived: number;
   lastUpdateAt: string | null;
+  customEmojiCapability?: {
+    state: 'unknown' | 'supported' | 'unsupported_by_telegram';
+    lastCheckedAt: string | null;
+    diagnosticAr: string;
+  };
 }
 
 interface BotInlineButton {
@@ -71,168 +78,13 @@ interface ChatMessage {
   accessDenied?: boolean;
 }
 
-function decodeHtmlEntitiesClient(str: string): string {
-  return str
-    .replace(/&nbsp;/gi, ' ')
-    .replace(/&quot;/gi, '"')
-    .replace(/&#39;|&apos;|&#x27;/gi, "'")
-    .replace(/&lt;/gi, '<')
-    .replace(/&gt;/gi, '>')
-    .replace(/&amp;/gi, '&');
-}
-
-function isSafeHttpUrl(url: string): boolean {
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === 'https:' || parsed.protocol === 'http:';
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Pure React AST renderer for Telegram HTML (ZERO dangerouslySetInnerHTML).
- * Safely renders <blockquote>, <b>/<strong>, <i>/<em>, <u>/<ins>, <s>/<strike>/<del>,
- * <code>, <pre>, <tg-spoiler>, <tg-emoji>, and safe https:// <a href="..."> links.
- */
-function renderTelegramHtmlNodes(html: string): React.ReactNode {
-  interface AstNode {
-    type: 'text' | 'el';
-    text?: string;
-    tag?: string;
-    href?: string;
-    emojiId?: string;
-    children?: AstNode[];
-  }
-
-  const root: AstNode = { type: 'el', tag: 'root', children: [] };
-  const stack: AstNode[] = [root];
-  const tagRe = /<(\/?)([a-zA-Z][a-zA-Z0-9-]*)(\s+(?:[^"'<>]|"[^"]*"|'[^']*')*)?\s*\/?>/g;
-  let cursor = 0;
-  let m: RegExpExecArray | null;
-
-  while ((m = tagRe.exec(html)) !== null) {
-    if (m.index > cursor) {
-      stack[stack.length - 1].children!.push({
-        type: 'text',
-        text: decodeHtmlEntitiesClient(html.slice(cursor, m.index)),
-      });
-    }
-    cursor = m.index + m[0].length;
-    const isClosing = m[1] === '/';
-    const tag = m[2].toLowerCase();
-    const attrStr = m[3] || '';
-
-    if (isClosing) {
-      for (let i = stack.length - 1; i >= 1; i--) {
-        if (stack[i].tag === tag) {
-          stack.splice(i);
-          break;
-        }
-      }
-      continue;
-    }
-
-    const hrefMatch = attrStr.match(/href\s*=\s*(?:"([^"]*)"|'([^']*)')/i);
-    const emojiMatch = attrStr.match(/emoji-id\s*=\s*(?:"(\d+)"|'(\d+)')/i);
-    const node: AstNode = {
-      type: 'el',
-      tag,
-      href: hrefMatch ? decodeHtmlEntitiesClient(hrefMatch[1] || hrefMatch[2] || '') : undefined,
-      emojiId: emojiMatch ? emojiMatch[1] || emojiMatch[2] : undefined,
-      children: [],
-    };
-    stack[stack.length - 1].children!.push(node);
-    stack.push(node);
-  }
-
-  if (cursor < html.length) {
-    stack[stack.length - 1].children!.push({
-      type: 'text',
-      text: decodeHtmlEntitiesClient(html.slice(cursor)),
-    });
-  }
-
-  const renderNode = (node: AstNode, key: string): React.ReactNode => {
-    if (node.type === 'text') return node.text || '';
-    const kids = (node.children || []).map((c, idx) => renderNode(c, `${key}-${idx}`));
-    switch (node.tag) {
-      case 'b':
-      case 'strong':
-        return <strong key={key}>{kids}</strong>;
-      case 'i':
-      case 'em':
-        return <em key={key}>{kids}</em>;
-      case 'u':
-      case 'ins':
-        return <span key={key} className="underline">{kids}</span>;
-      case 's':
-      case 'strike':
-      case 'del':
-        return <span key={key} className="line-through">{kids}</span>;
-      case 'code':
-        return (
-          <code key={key} className="rounded bg-slate-100 px-1 py-0.5 font-mono text-xs text-slate-900">
-            {kids}
-          </code>
-        );
-      case 'pre':
-        return (
-          <pre key={key} className="my-1 overflow-x-auto rounded bg-slate-900 p-2 font-mono text-xs text-slate-100">
-            {kids}
-          </pre>
-        );
-      case 'blockquote':
-        return (
-          <blockquote
-            key={key}
-            className="my-1.5 rounded-md border-r-2 border-sky-500 bg-slate-50 px-2.5 py-1.5 text-[13px] text-slate-700"
-          >
-            {kids}
-          </blockquote>
-        );
-      case 'tg-spoiler':
-        return (
-          <span key={key} className="rounded bg-slate-200 px-1 text-slate-700" title="Spoiler">
-            {kids}
-          </span>
-        );
-      case 'tg-emoji':
-        return (
-          <span key={key} title={node.emojiId ? `Custom Emoji #${node.emojiId}` : undefined}>
-            {kids}
-          </span>
-        );
-      case 'a':
-        if (node.href && isSafeHttpUrl(node.href)) {
-          return (
-            <a
-              key={key}
-              href={node.href}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-sky-600 underline hover:text-sky-700"
-            >
-              {kids}
-            </a>
-          );
-        }
-        return <React.Fragment key={key}>{kids}</React.Fragment>;
-      default:
-        return <React.Fragment key={key}>{kids}</React.Fragment>;
-    }
-  };
-
-  return (root.children || []).map((c, idx) => renderNode(c, `h-${idx}`));
-}
-
 function renderFormattedTelegramText(
   text: string,
   entities?: any[],
   parseMode?: 'HTML'
 ): React.ReactNode {
   if (parseMode === 'HTML') {
-    return renderTelegramHtmlNodes(text);
+    return <TelegramHtmlRenderer html={text} />;
   }
   if (!Array.isArray(entities) || entities.length === 0) {
     return text;
@@ -702,7 +554,7 @@ export default function TelegramBotConsole({
               />
             </div>
 
-            <div className="md:col-span-3">
+              <div className="md:col-span-3">
               <button
                 type="submit"
                 disabled={liveBusy}
@@ -712,6 +564,32 @@ export default function TelegramBotConsole({
               </button>
             </div>
           </form>
+        )}
+
+        {liveStatus?.customEmojiCapability && (
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 bg-slate-50/40 px-5 py-2.5 text-[11px] text-slate-600">
+            <div className="flex items-center gap-2 min-w-0">
+              <Sparkles className="h-3.5 w-3.5 shrink-0 text-sky-600" />
+              <span className="font-semibold text-slate-800">دعم Telegram Custom Emoji:</span>
+              <span className="truncate sm:whitespace-normal">{liveStatus.customEmojiCapability.diagnosticAr}</span>
+            </div>
+            <SemanticStatus
+              tone={
+                liveStatus.customEmojiCapability.state === 'supported'
+                  ? 'positive'
+                  : liveStatus.customEmojiCapability.state === 'unsupported_by_telegram'
+                    ? 'warning'
+                    : 'neutral'
+              }
+              label={
+                liveStatus.customEmojiCapability.state === 'supported'
+                  ? 'مفعّل على البوت'
+                  : liveStatus.customEmojiCapability.state === 'unsupported_by_telegram'
+                    ? 'البديل التلقائي نشط'
+                    : 'حفظ المعرّفات نشط'
+              }
+            />
+          </div>
         )}
       </SurfacePanel>
 

@@ -28,6 +28,7 @@ import {
   SurfacePanel,
 } from './ui/AdminPrimitives';
 import CustomerLocalDepositModal from './CustomerLocalDepositModal';
+import TelegramHtmlRenderer from './TelegramHtmlRenderer';
 
 export interface StorefrontProduct {
   id: number;
@@ -238,17 +239,15 @@ export default function CustomerStorefront({
   const getProductTitle = (item: StorefrontProduct) =>
     stripTelegramHtml(isEn ? item.titleEn || item.titleAr : item.titleAr || item.titleEn || '');
 
-  const getProductDesc = (item: StorefrontProduct) => {
-    const raw = stripTelegramHtml(
-      isEn ? item.descriptionEn || item.descriptionAr : item.descriptionAr || item.descriptionEn || ''
-    );
+  const getProductDescHtml = (item: StorefrontProduct) => {
+    const raw = (isEn ? item.descriptionEn || item.descriptionAr : item.descriptionAr || item.descriptionEn || '').trim();
     if (!raw) return '';
     return raw
       .split(/\r?\n/)
       .filter(
         (line) =>
           !/منتج\s*مستورد\s*تلقائي|مخفي\s*افتراضي|حتى\s*التفعيل\s*والتسعير|auto[-\s]*imported\s*from|hidden\s*by\s*default/i.test(
-            line
+            stripTelegramHtml(line)
           )
       )
       .join('\n')
@@ -570,13 +569,13 @@ export default function CustomerStorefront({
               </div>
 
               {(() => {
-                const descText = getProductDesc(selectedProduct);
+                const descHtml = getProductDescHtml(selectedProduct);
                 const warrantyText = getWarrantyDisplay(selectedProduct);
                 return (
                   <div className="rounded-xl bg-slate-50/70 border border-slate-100 p-4 text-xs text-slate-700 leading-relaxed space-y-2">
-                    {descText && <p className="whitespace-pre-line">{descText}</p>}
+                    {descHtml && <TelegramHtmlRenderer html={descHtml} />}
                     <div
-                      className={`${descText ? 'border-t border-slate-200/70 pt-2' : ''} text-slate-500`}
+                      className={`${descHtml ? 'border-t border-slate-200/70 pt-2' : ''} text-slate-500`}
                     >
                       {isEn ? (
                         <>
@@ -939,10 +938,12 @@ export default function CustomerStorefront({
                         {getProductTitle(item)}
                       </h2>
 
-                      {getProductDesc(item) && (
-                        <p className="text-xs text-slate-600 leading-relaxed line-clamp-3">
-                          {getProductDesc(item)}
-                        </p>
+                      {getProductDescHtml(item) && (
+                        <TelegramHtmlRenderer
+                          html={getProductDescHtml(item)}
+                          compact
+                          className="text-xs text-slate-600 leading-relaxed line-clamp-3"
+                        />
                       )}
 
                       {getWarrantyDisplay(item) && (

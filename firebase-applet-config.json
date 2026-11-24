@@ -3,6 +3,7 @@
   "appId": "1:421753230603:web:156ff535ba8e1d38023e0e",
   "apiKey": "AIzaSyAYOyZdd1Z8Fe-qG6SYu91wwZxLYulzj08",
   "authDomain": "dauntless-elf-zpjks.firebaseapp.com",
+  "firestoreDatabaseId": "ai-studio-c4e65b08-084f-4b15-a3aa-c40680c0eebc",
   "storageBucket": "dauntless-elf-zpjks.firebasestorage.app",
   "messagingSenderId": "421753230603",
   "measurementId": "",

@@ -36,12 +36,23 @@ import {
 import {
   classifyDescriptionUrl,
   detectDescriptionFormat,
+  extractCustomEmojiIds,
   extractSupplierRawDescription,
+  normalizeOriginalTelegramHtmlForPreview,
   processSupplierProductDescription,
   registerDynamicSupplierIdentities,
+  replaceDisallowedCustomEmojis,
   stripTelegramHtmlToPlainText,
   stripTgEmojiTagsKeepFallback,
 } from './productDescriptionEngine.ts';
+import {
+  buildSupplierBrowserItem,
+  extractPaginationDirective,
+  filterAndPaginateSupplierBrowserItems,
+  normalizeRichSupplierCatalog,
+  sanitizeSupplierImageUrl,
+  validateAndPlanSupplierImport,
+} from './supplierCatalogBrowser.ts';
 import {
   buildBinanceSignedQuery,
   verifyBinancePayTransaction,
@@ -75,6 +86,8 @@ import {
   planBilingualTextResolution,
   splitLeadingEmoji,
   ensurePreservedEmoji,
+  protectTelegramHtmlForTranslation,
+  restoreProtectedTelegramHtml,
 } from './translator.ts';
 import {
   parseYeRialApiResponse,
@@ -152,6 +165,14 @@ import {
   filterServersForGrid,
 } from '../lib/serverGridUtils.ts';
 import { encryptSecret, decryptSecret, maskApiKey, verifyHmacSha256 } from './crypto.ts';
+import { isValidCustomEmojiId, filterValidCustomEmojisInHtml } from './customEmojiService.ts';
+import {
+  filterUnlinkedAvailableOffers,
+  validateExclusiveOfferBinding,
+  computeRecompactedPriorities,
+  isOfferCompatibleWithStoreProduct,
+  auditAllProductMappings,
+} from './providerMappingEngine.ts';
 import crypto from 'node:crypto';
 
 // ============================================================================
@@ -3386,6 +3407,418 @@ test('41. ProductDescriptionEngine handles all 10 supplier description cases: Te
   assert.equal(classifyDescriptionUrl('https://www.duolingo.com/redeem?code=XYZ').allowed, true);
   assert.equal(stripTelegramHtmlToPlainText('<b>Hello &amp; Welcome</b>').trim(), 'Hello & Welcome');
 });
+
+test('42. Telegram Custom Emoji preservation, per-emoji fallback, & translation HTML protection', async () => {
+  // Multi-supplier custom emojis: standard emoji-id, custom_emoji_id alias, empty inner text & self-closing <tg-emoji/>
+  const supplierRaw =
+    '<blockquote>' +
+    '<tg-emoji emoji-id="5206660927339924387">🚀</tg-emoji> <b>Gemini Plus 6M</b>\n' +
+    '<tg-emoji custom_emoji_id="5796504385420792898">🛡️</tg-emoji> Official Warranty\n' +
+    '<tg-emoji emoji-id="5312441427364999111" /> Instant Delivery\n' +
+    '🔥 Visit https://t.me/supplier_ads\n' +
+    '</blockquote>';
+
+  const processed = processSupplierProductDescription(supplierRaw);
+  assert.equal(processed.hasCustomEmoji, true);
+  assert.equal(processed.detectedFormat, 'telegram_html');
+  // Supplier ad line removed while all 3 custom emojis remain intact in original order!
+  assert.equal(processed.telegramHtml.includes('supplier_ads'), false);
+  assert.ok(processed.telegramHtml.includes('<tg-emoji emoji-id="5206660927339924387">🚀</tg-emoji>'));
+  assert.ok(processed.telegramHtml.includes('<tg-emoji emoji-id="5796504385420792898">🛡️</tg-emoji>'));
+  assert.ok(processed.telegramHtml.includes('<tg-emoji emoji-id="5312441427364999111">✨</tg-emoji>'));
+  assert.deepEqual(extractCustomEmojiIds(processed.telegramHtml), [
+    '5206660927339924387',
+    '5796504385420792898',
+    '5312441427364999111',
+  ]);
+
+  // ID validation
+  assert.equal(isValidCustomEmojiId('5206660927339924387'), true);
+  assert.equal(isValidCustomEmojiId('12'), false);
+  assert.equal(isValidCustomEmojiId('not-a-number'), false);
+
+  // Per-emoji selective downgrade: drop ONLY unavailable ID 5796504385420792898 while keeping the other 2 + HTML
+  const validOnlyTwo = new Set(['5206660927339924387', '5312441427364999111']);
+  const partialFallback = replaceDisallowedCustomEmojis(processed.telegramHtml, validOnlyTwo);
+  assert.ok(partialFallback.includes('<tg-emoji emoji-id="5206660927339924387">🚀</tg-emoji>'));
+  assert.ok(partialFallback.includes('<tg-emoji emoji-id="5312441427364999111">✨</tg-emoji>'));
+  assert.equal(partialFallback.includes('5796504385420792898'), false);
+  assert.ok(partialFallback.includes('🛡️ Official Warranty'));
+  assert.ok(partialFallback.includes('<blockquote>') && partialFallback.includes('<b>Gemini Plus 6M</b>'));
+
+  // No-token mode keeps tags untouched in pre-send filter
+  const passthrough = await filterValidCustomEmojisInHtml(processed.telegramHtml, '');
+  assert.equal(passthrough.html, processed.telegramHtml);
+  assert.deepEqual(passthrough.keptIds, [
+    '5206660927339924387',
+    '5796504385420792898',
+    '5312441427364999111',
+  ]);
+
+  // Translation HTML + Custom Emoji protection round-trip (tolerates spaces added by MT around placeholders)
+  const sampleHtml =
+    '<blockquote><tg-emoji emoji-id="5206660927339924387">🚀</tg-emoji> <b>تفعيل رسمي</b> عبر <a href="https://one.google.com/redeem">الرابط الرسمي</a></blockquote>';
+  const protectedPayload = protectTelegramHtmlForTranslation(sampleHtml);
+  assert.equal(protectedPayload.hasProtectedTokens, true);
+  assert.equal(protectedPayload.masked.includes('5206660927339924387'), false);
+  assert.equal(protectedPayload.masked.includes('one.google.com'), false);
+
+  // Simulate machine translation inserting spaces around placeholders
+  const simulatedTranslated = protectedPayload.masked
+    .replace('[[TG_CE_0]]', '[[ TG_CE_0 ]]')
+    .replace('تفعيل رسمي', 'Official Activation')
+    .replace('عبر', 'via')
+    .replace('الرابط الرسمي', 'Official Link');
+  const restored = restoreProtectedTelegramHtml(simulatedTranslated, protectedPayload.tokens);
+  assert.ok(restored.includes('<tg-emoji emoji-id="5206660927339924387">🚀</tg-emoji>'));
+  assert.ok(restored.includes('<a href="https://one.google.com/redeem">Official Link</a>'));
+  assert.ok(restored.startsWith('<blockquote>'));
+  assert.ok(restored.endsWith('</blockquote>'));
+});
+
+test('43. Exclusive provider binding, pool filtering, priority recompaction, & catalog mapping audit', () => {
+  const pool = [
+    { id: 101, linkedStoreProductId: 10, linkedStoreProductTitle: 'Canva Pro 12M' },
+    { id: 102, linkedStoreProductId: null, linkedStoreProductTitle: null },
+    { id: 103, linkedStoreProductId: undefined, linkedStoreProductTitle: null },
+    { id: 104, linkedStoreProductId: 12, linkedStoreProductTitle: 'Zoom Pro 1M' },
+  ];
+
+  // 1. Available pool strictly excludes any offer linked to any store product
+  const unlinked = filterUnlinkedAvailableOffers(pool);
+  assert.deepEqual(
+    unlinked.map((o) => o.id),
+    [102, 103]
+  );
+
+  // Exclude extra offers already staged in creation form
+  const unlinkedMinusStaged = filterUnlinkedAvailableOffers(pool, [102]);
+  assert.deepEqual(
+    unlinkedMinusStaged.map((o) => o.id),
+    [103]
+  );
+
+  // Once unlinked, offer returns immediately to available pool
+  pool[0].linkedStoreProductId = null;
+  pool[0].linkedStoreProductTitle = null;
+  assert.deepEqual(
+    filterUnlinkedAvailableOffers(pool).map((o) => o.id),
+    [101, 102, 103]
+  );
+
+  // 2. Server-side exclusive binding guard
+  const existingMappings = [
+    { id: 501, storeProductId: 10, providerProductId: 201, storeProductTitle: 'Gemini Plus 6M' },
+    { id: 502, storeProductId: 20, providerProductId: 202, storeProductTitle: 'Canva Pro 12M' },
+  ];
+  assert.equal(validateExclusiveOfferBinding(existingMappings, 10, 299).ok, true);
+
+  const sameConflict = validateExclusiveOfferBinding(existingMappings, 10, 201);
+  assert.equal(sameConflict.ok, false);
+  if (!sameConflict.ok) {
+    assert.equal(sameConflict.code, 'ALREADY_LINKED_SAME_PRODUCT');
+    assert.equal(sameConflict.conflictStoreProductId, 10);
+  }
+
+  const crossConflict = validateExclusiveOfferBinding(existingMappings, 10, 202);
+  assert.equal(crossConflict.ok, false);
+  if (!crossConflict.ok) {
+    assert.equal(crossConflict.code, 'ALREADY_LINKED_OTHER_PRODUCT');
+    assert.equal(crossConflict.conflictStoreProductId, 20);
+    assert.equal(crossConflict.conflictStoreProductTitle, 'Canva Pro 12M');
+  }
+
+  // 3. Recompacting priorities cleanly when removing #1 or middle provider
+  const recompacted = computeRecompactedPriorities(
+    [
+      { id: 11, priority: 1 },
+      { id: 12, priority: 2 },
+      { id: 13, priority: 3 },
+    ],
+    11
+  );
+  assert.deepEqual(recompacted, [
+    { id: 12, priority: 1, roleType: 'primary' },
+    { id: 13, priority: 2, roleType: 'backup' },
+  ]);
+
+  // 4. Service/brand compatibility & full catalog audit
+  assert.equal(
+    isOfferCompatibleWithStoreProduct({
+      storeProductTitle: 'Canva Pro 12M Private',
+      storeProductCategoryName: 'التصميم والمونتاج',
+      providerOfferRawName: 'Canva Edu Pro 1 Year Invitation',
+    }).compatible,
+    true
+  );
+
+  const mismatchCheck = isOfferCompatibleWithStoreProduct({
+    storeProductTitle: 'ChatGPT Plus 1 Month',
+    storeProductCategoryName: 'الذكاء الاصطناعي',
+    providerOfferRawName: 'CapCut Pro 30 Days Private',
+  });
+  assert.equal(mismatchCheck.compatible, false);
+
+  const auditReport = auditAllProductMappings([
+    {
+      mappingId: 1,
+      storeProductId: 10,
+      storeProductTitle: 'Gemini Plus 6M',
+      storeProductCategoryName: 'Google AI',
+      storeProductVisible: true,
+      providerProductId: 301,
+      providerId: 1,
+      providerName: 'Pixora',
+      providerEnabled: true,
+      providerStatus: 'connected',
+      providerOfferRawName: 'Gemini Google AI Pro 6 Months',
+      isActiveAtProvider: true,
+      wholesalePrice: '1.80',
+      stockCount: 15,
+      priority: 1,
+      isActiveMapping: true,
+    },
+    {
+      mappingId: 2,
+      storeProductId: 11,
+      storeProductTitle: 'Netflix 4K 1M',
+      storeProductVisible: false,
+      providerProductId: 302,
+      providerId: 2,
+      providerName: 'Bulkware',
+      providerEnabled: false,
+      providerStatus: 'disabled',
+      providerOfferRawName: 'Netflix Ultra HD 30D',
+      isActiveAtProvider: true,
+      wholesalePrice: '2.50',
+      stockCount: 0,
+      priority: 1,
+      isActiveMapping: true,
+    },
+    {
+      mappingId: 3,
+      storeProductId: 12,
+      storeProductTitle: 'ChatGPT Plus 1M',
+      storeProductVisible: true,
+      providerProductId: 303,
+      providerId: 3,
+      providerName: 'LukuAI',
+      providerEnabled: true,
+      providerStatus: 'connected',
+      providerOfferRawName: 'CapCut Pro 1 Month Slot',
+      isActiveAtProvider: true,
+      wholesalePrice: '3.00',
+      stockCount: 4,
+      priority: 1,
+      isActiveMapping: true,
+    },
+  ]);
+
+  assert.equal(auditReport.summary.totalMappings, 3);
+  assert.equal(auditReport.summary.healthyCount, 1);
+  assert.equal(auditReport.summary.flaggedCount, 2);
+  assert.equal(auditReport.summary.disabledProviderCount, 1);
+  assert.equal(auditReport.summary.mismatchCount, 1);
+  assert.deepEqual(
+    auditReport.issues.map((i) => i.mappingId).sort((a, b) => a - b),
+    [2, 3]
+  );
+});
+
+test('48. Heterogeneous Supplier Catalog Normalizer extracts full metadata, variants, pagination, and XSS-safe images', () => {
+  // 1. Image URL sanitization blocks SSRF / localhost / javascript schemes and allows safe https/http
+  assert.equal(sanitizeSupplierImageUrl('https://cdn.example.com/img/pro.png'), 'https://cdn.example.com/img/pro.png');
+  assert.equal(sanitizeSupplierImageUrl('javascript:alert(1)'), '');
+  assert.equal(sanitizeSupplierImageUrl('http://127.0.0.1:8080/internal.png'), '');
+  assert.equal(sanitizeSupplierImageUrl('http://169.254.169.254/latest/meta-data'), '');
+
+  // 2. Heterogeneous supplier response shapes (nested attributes, features, variants, suggested retail price, custom emojis)
+  const rawPayload = {
+    data: {
+      products: [
+        {
+          service_id: 'svc_claude_1m',
+          name: 'Claude Pro Max',
+          image_url: 'https://cdn.vendor.io/claude.png',
+          category_name: 'AI Subscriptions',
+          product_type: 'account',
+          duration_label: '30 Days',
+          warranty_days: 28,
+          reseller_price: '14.50',
+          msrp: '20.00',
+          stock_count: 18,
+          min_qty: 1,
+          max_qty: 10,
+          region: 'Global',
+          attributes: {
+            description_html:
+              '<blockquote><tg-emoji emoji-id="5368324170671202286">⚡</tg-emoji> <b>Claude Pro</b> Official Access</blockquote>\nVisit our store https://warzoneshop.in/shop\nRedeem at https://claude.ai/redeem<script>alert(1)</script>',
+          },
+          features: ['Instant Delivery', 'Private Seat'],
+          variants: [
+            { id: 'v_1m', name: '1 Month', price_usdt: '14.50', stock: 12, duration: '30 Days' },
+            { id: 'v_3m', name: '3 Months', price_usdt: '39.00', stock: 6, duration: '90 Days' },
+          ],
+        },
+        {
+          id: 902,
+          title: 'Canva Edu Pro',
+          price: 1.25,
+          available: 40,
+          specs: { SeatType: 'Admin Invite', Validity: '12 Months' },
+        },
+      ],
+      meta: { current_page: 1, last_page: 3, per_page: 2 },
+    },
+  };
+
+  const normalized = normalizeRichSupplierCatalog(rawPayload);
+  assert.equal(normalized.length, 3);
+
+  assert.equal(normalized[0].externalProductId, 'svc_claude_1m');
+  assert.equal(normalized[0].externalVariantId, 'v_1m');
+  assert.equal(normalized[0].rawName, 'Claude Pro Max — 1 Month');
+  assert.equal(normalized[0].imageUrl, 'https://cdn.vendor.io/claude.png');
+  assert.equal(normalized[0].categoryName, 'AI Subscriptions');
+  assert.equal(normalized[0].suggestedRetailPrice, '20.0000');
+  assert.equal(normalized[0].variantsSummary.length, 2);
+  assert.deepEqual(normalized[0].features, ['Instant Delivery', 'Private Seat']);
+  assert.equal(normalized[0].extraMetadata.region, 'Global');
+
+  // Synthesized fallback specs description when no explicit description key exists
+  assert.ok(normalized[2].rawDescription.includes('SeatType: Admin Invite'));
+
+  // 3. Preview HTML keeps original links & <tg-emoji> while stripping <script>; Import HTML scrubs supplier store link
+  const preview = normalizeOriginalTelegramHtmlForPreview(normalized[0].rawDescription);
+  assert.ok(preview.includes('<tg-emoji emoji-id="5368324170671202286">⚡</tg-emoji>'));
+  assert.ok(!preview.includes('<script>'));
+  assert.ok(preview.includes('warzoneshop.in'));
+
+  const browserItem = buildSupplierBrowserItem(normalized[0], {
+    extraSupplierNames: ['Warzone Shop'],
+  });
+  assert.ok(browserItem.cleanedImportHtml.includes('<tg-emoji emoji-id="5368324170671202286">⚡</tg-emoji>'));
+  assert.ok(browserItem.cleanedImportHtml.includes('https://claude.ai/redeem'));
+  assert.ok(!browserItem.cleanedImportHtml.includes('warzoneshop.in'));
+
+  // 4. Pagination directives (page, cursor, offset, same-origin next_page_url vs cross-origin SSRF block)
+  const pPage = extractPaginationDirective(rawPayload.data, 1, 0, 2, 2, 'https://api.vendor.io');
+  assert.deepEqual(pPage, { kind: 'page', nextPage: 2, limit: 2 });
+
+  const pSafeUrl = extractPaginationDirective(
+    { next_page_url: 'https://api.vendor.io/products?page=2' },
+    1,
+    0,
+    50,
+    50,
+    'https://api.vendor.io'
+  );
+  assert.deepEqual(pSafeUrl, { kind: 'url', nextUrl: 'https://api.vendor.io/products?page=2' });
+
+  const pBlockedSsrf = extractPaginationDirective(
+    { next_page_url: 'http://169.254.169.254/steal' },
+    1,
+    0,
+    50,
+    50,
+    'https://api.vendor.io'
+  );
+  assert.deepEqual(pBlockedSsrf, { kind: 'none' });
+});
+
+test('49. Supplier Product Browser filtering, duplicate protection, update semantics, and strict category validation', () => {
+  const rawCatalog = normalizeRichSupplierCatalog([
+    {
+      id: 'p-1',
+      name: 'Adobe Creative Cloud 1M',
+      category: 'Design',
+      price: '4.00',
+      stock: 10,
+      description: '<b>Official Adobe CC</b> access',
+    },
+    {
+      id: 'p-2',
+      name: 'Cursor Pro 14D',
+      category: 'Developer',
+      price: '3.20',
+      stock: 5,
+      description: 'Cursor AI Pro workspace',
+    },
+  ]);
+
+  const item1 = buildSupplierBrowserItem(rawCatalog[0], {
+    existingLink: {
+      providerProductId: 50,
+      storeProductId: 700,
+      storeProductTitle: 'Adobe CC 1M',
+      storeCategoryId: 10,
+      storeIsVisible: true,
+      storeDescriptionEmpty: false,
+    },
+  });
+  const item2 = buildSupplierBrowserItem(rawCatalog[1], { existingLink: null });
+
+  assert.equal(item1.importStatus, 'imported');
+  assert.equal(item2.importStatus, 'not_imported');
+
+  // Filtering by search, category, and importStatus
+  const onlyNotImported = filterAndPaginateSupplierBrowserItems([item1, item2], {
+    status: 'not_imported',
+    page: 1,
+    pageSize: 24,
+  });
+  assert.equal(onlyNotImported.totalMatched, 1);
+  assert.equal(onlyNotImported.items[0].externalProductId, 'p-2');
+
+  const validCats = new Set<number>([10, 14]);
+
+  // Missing or nonexistent category is rejected (never auto-created!)
+  const missingCatPlan = validateAndPlanSupplierImport({
+    sourceItem: item2,
+    requestedCategoryId: null,
+    validCategoryIds: validCats,
+  });
+  assert.equal(missingCatPlan.ok, false);
+
+  const nonExistentCatPlan = validateAndPlanSupplierImport({
+    sourceItem: item2,
+    requestedCategoryId: 9999,
+    validCategoryIds: validCats,
+  });
+  assert.equal(nonExistentCatPlan.ok, false);
+
+  // Valid new import passes cleanly with full description preserved
+  const createPlan = validateAndPlanSupplierImport({
+    sourceItem: item2,
+    requestedCategoryId: 14,
+    validCategoryIds: validCats,
+  });
+  assert.equal(createPlan.ok, true);
+  assert.equal(createPlan.action, 'create');
+  assert.equal(createPlan.finalDescriptionHtml, 'Cursor AI Pro workspace');
+
+  // Duplicate import is skipped by default unless explicit 'update' is requested
+  const skipDupPlan = validateAndPlanSupplierImport({
+    sourceItem: item1,
+    requestedCategoryId: 10,
+    validCategoryIds: validCats,
+    requestedAction: 'create',
+  });
+  assert.equal(skipDupPlan.ok, false);
+  assert.equal(skipDupPlan.action, 'skip');
+
+  const updateDupPlan = validateAndPlanSupplierImport({
+    sourceItem: item1,
+    requestedCategoryId: 10,
+    validCategoryIds: validCats,
+    requestedAction: 'update',
+  });
+  assert.equal(updateDupPlan.ok, true);
+  assert.equal(updateDupPlan.action, 'update');
+  assert.equal(updateDupPlan.finalDescriptionHtml, '<b>Official Adobe CC</b> access');
+});
+
+
 
 
 

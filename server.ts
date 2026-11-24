@@ -72,7 +72,19 @@ import {
   sanitizeCustomerProductDescription,
   sanitizeErrorForCustomer,
 } from './src/server/sanitizer.ts';
-import { registerDynamicSupplierIdentities } from './src/server/productDescriptionEngine.ts';
+import {
+  normalizeOriginalTelegramHtmlForPreview,
+  processSupplierProductDescription,
+  registerDynamicSupplierIdentities,
+} from './src/server/productDescriptionEngine.ts';
+import {
+  buildSupplierBrowserItem,
+  filterAndPaginateSupplierBrowserItems,
+  makeSupplierOfferKey,
+  validateAndPlanSupplierImport,
+  type ExistingStoreLinkInfo,
+  type RichNormalizedCatalogItem,
+} from './src/server/supplierCatalogBrowser.ts';
 import {
   autoTranslateBilingual,
   resolveBilingualFields,
@@ -113,6 +125,7 @@ import {
 } from './src/server/orderEngine.ts';
 import {
   bootstrapTelegramBotOnStartup,
+  getActiveTelegramBotToken,
   getLiveBotUsername,
   getTelegramBotInstanceAsync,
   getTelegramBotRuntimeStatus,
@@ -124,6 +137,16 @@ import {
   startOrRestartTelegramBot,
   stopRealTelegramBot,
 } from './src/server/telegramEngine.ts';
+import {
+  fetchCustomEmojiMediaProxy,
+  isValidCustomEmojiId,
+} from './src/server/customEmojiService.ts';
+import {
+  auditAllProductMappings,
+  computeRecompactedPriorities,
+  validateExclusiveOfferBinding,
+  type MappingRecordForAudit,
+} from './src/server/providerMappingEngine.ts';
 import {
   buildBroadcastResultSummaryAr,
   executeBroadcastDelivery,
@@ -681,6 +704,30 @@ async function buildApp() {
     }
   });
 
+  app.get('/api/telegram/custom-emoji/:emojiId', async (req: Request, res: Response) => {
+    const emojiId = String(req.params.emojiId || '').trim();
+    if (!isValidCustomEmojiId(emojiId)) {
+      return res.status(400).json({ error: 'Invalid custom emoji ID' });
+    }
+    try {
+      const token = await getActiveTelegramBotToken();
+      if (!token) {
+        res.setHeader('Cache-Control', 'public, max-age=60');
+        return res.status(204).end();
+      }
+      const media = await fetchCustomEmojiMediaProxy(token, emojiId);
+      if (!media) {
+        res.setHeader('Cache-Control', 'public, max-age=300');
+        return res.status(204).end();
+      }
+      res.setHeader('Content-Type', media.contentType);
+      res.setHeader('Cache-Control', 'public, max-age=86400');
+      return res.send(media.buffer);
+    } catch {
+      return res.status(204).end();
+    }
+  });
+
   app.post('/api/telegram/simulate', requireAuth, async (req: AuthRequest, res: Response) => {
     try {
       const requestedMode = req.body?.mode === 'admin' ? 'admin' : 'customer';
@@ -1162,6 +1209,535 @@ async function buildApp() {
     }
   });
 
+  // Short-lived per-provider live catalog cache for fast pagination/filtering & selective import
+  const supplierCatalogBrowserCache = new Map<
+    number,
+    { fetchedAt: number; items: RichNormalizedCatalogItem[] }
+  >();
+  const SUPPLIER_BROWSER_CACHE_TTL_MS = 90_000;
+
+  async function fetchLiveRichCatalogForProvider(prov: typeof providers.$inferSelect, forceRefresh = false) {
+    const now = Date.now();
+    const cached = supplierCatalogBrowserCache.get(prov.id);
+    if (!forceRefresh && cached && now - cached.fetchedAt < SUPPLIER_BROWSER_CACHE_TTL_MS) {
+      return { items: cached.items, fetchedAt: cached.fetchedAt, fromCache: true };
+    }
+
+    const [cred] = await db
+      .select()
+      .from(providerCredentials)
+      .where(eq(providerCredentials.providerId, prov.id))
+      .limit(1);
+
+    if (!cred) {
+      const err = new Error('لم يتم إدخال مفتاح API لهذا الخادم بعد. يرجى إدخال المفتاح أولًا لتصفح المنتجات مباشرة من الخادم.') as Error & {
+        statusCode?: number;
+        code?: string;
+      };
+      err.statusCode = 400;
+      err.code = 'NO_API_KEY';
+      throw err;
+    }
+
+    const rawKey = decryptSecret(cred.encryptedApiKey);
+    const adapter = resolveProviderAdapter({
+      code: prov.code,
+      name: prov.name,
+      baseUrl: prov.baseUrl,
+      docsUrl: prov.docsUrl,
+      authType: prov.authType,
+      authHeader: prov.authHeader,
+      rateLimitPerMin: prov.rateLimitPerMin,
+    });
+
+    const fetched = await adapter.fetchProducts(rawKey);
+    const richItems: RichNormalizedCatalogItem[] = fetched.map((it) => ({
+      externalProductId: it.externalProductId,
+      externalVariantId: it.externalVariantId || '',
+      rawName: it.rawName,
+      rawDescription: it.rawDescription || '',
+      imageUrl: it.imageUrl || '',
+      wholesalePrice: it.wholesalePrice,
+      suggestedRetailPrice: it.suggestedRetailPrice ?? null,
+      currency: it.currency || 'USD',
+      stockCount: Number(it.stockCount || 0),
+      isAvailable: it.isAvailable ?? Number(it.stockCount || 0) > 0,
+      minQty: Math.max(1, Number(it.minQty || 1)),
+      maxQty: Math.max(1, Number(it.maxQty || 1000)),
+      deliveryType: it.deliveryType || 'code',
+      deliveryInstructions: it.deliveryInstructions || '',
+      durationLabel: it.durationLabel || '',
+      warrantyDays: Number(it.warrantyDays || 0),
+      warrantyLabel: it.warrantyLabel || (it.warrantyDays > 0 ? `${it.warrantyDays} يوم` : ''),
+      productType: it.productType || '',
+      categoryName: it.categoryName || '',
+      features: Array.isArray(it.features) ? it.features : [],
+      variantsSummary: Array.isArray(it.variantsSummary) ? it.variantsSummary : [],
+      pricingTiers: it.pricingTiers,
+      extraMetadata: it.extraMetadata || {},
+    }));
+
+    supplierCatalogBrowserCache.set(prov.id, { fetchedAt: now, items: richItems });
+    return { items: richItems, fetchedAt: now, fromCache: false };
+  }
+
+  /**
+   * Live Supplier Product Browser:
+   * Fetches real catalog directly from the supplier API (with explicit refresh & pagination),
+   * preserves original unaltered data + formatted Telegram HTML preview, and annotates existing imports.
+   */
+  app.get('/api/admin/providers/:id/browse-catalog', ...requireAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const providerId = Number(req.params.id);
+      if (!Number.isInteger(providerId) || providerId <= 0) {
+        return res.status(400).json({ error: 'معرف الخادم غير صالح.' });
+      }
+      const [prov] = await db.select().from(providers).where(eq(providers.id, providerId)).limit(1);
+      if (!prov) return res.status(404).json({ error: 'الخادم غير موجود.' });
+
+      registerDynamicSupplierIdentities([prov]);
+
+      const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+      const live = await fetchLiveRichCatalogForProvider(prov, forceRefresh);
+
+      // Load existing DB provider_products + exclusive store mappings to accurately flag duplicates
+      const existingRows = await db
+        .select({
+          ppId: providerProducts.id,
+          externalProductId: providerProducts.externalProductId,
+          externalVariantId: providerProducts.externalVariantId,
+          storeProductId: storeProducts.id,
+          storeProductTitle: storeProducts.titleAr,
+          storeCategoryId: storeProducts.categoryId,
+          storeIsVisible: storeProducts.isVisible,
+          storeDescriptionAr: storeProducts.descriptionAr,
+        })
+        .from(providerProducts)
+        .leftJoin(productProviderMappings, eq(productProviderMappings.providerProductId, providerProducts.id))
+        .leftJoin(storeProducts, eq(productProviderMappings.storeProductId, storeProducts.id))
+        .where(eq(providerProducts.providerId, providerId));
+
+      const existingMap = new Map<string, ExistingStoreLinkInfo>();
+      for (const row of existingRows) {
+        const key = makeSupplierOfferKey(row.externalProductId, row.externalVariantId || '');
+        existingMap.set(key, {
+          providerProductId: row.ppId,
+          storeProductId: row.storeProductId ?? null,
+          storeProductTitle: row.storeProductTitle ?? null,
+          storeCategoryId: row.storeCategoryId ?? null,
+          storeIsVisible: row.storeIsVisible ?? null,
+          storeDescriptionEmpty: !(row.storeDescriptionAr || '').trim(),
+        });
+      }
+
+      const browserItems = live.items.map((item) => {
+        const key = makeSupplierOfferKey(item.externalProductId, item.externalVariantId);
+        return buildSupplierBrowserItem(item, {
+          extraSupplierNames: [prov.name, prov.code],
+          existingLink: existingMap.get(key) || null,
+        });
+      });
+
+      const statusParam =
+        req.query.status === 'imported' || req.query.status === 'not_imported' ? req.query.status : 'all';
+      const paged = filterAndPaginateSupplierBrowserItems(browserItems, {
+        search: typeof req.query.search === 'string' ? req.query.search : '',
+        category: typeof req.query.category === 'string' ? req.query.category : 'all',
+        status: statusParam,
+        page: Number(req.query.page || 1),
+        pageSize: Number(req.query.pageSize || 24),
+      });
+
+      const importedCount = browserItems.filter((i) => i.importStatus === 'imported').length;
+
+      return res.json({
+        ok: true,
+        provider: {
+          id: prov.id,
+          code: prov.code,
+          name: prov.name,
+          baseUrl: prov.baseUrl,
+          status: prov.status,
+          hasApiKey: true,
+        },
+        items: paged.items,
+        totalCatalogCount: browserItems.length,
+        importedCount,
+        notImportedCount: browserItems.length - importedCount,
+        totalMatched: paged.totalMatched,
+        page: paged.page,
+        pageSize: paged.pageSize,
+        totalPages: paged.totalPages,
+        categories: paged.distinctCategories,
+        fetchedAt: new Date(live.fetchedAt).toISOString(),
+        fromCache: live.fromCache,
+      });
+    } catch (err: any) {
+      const statusCode = err?.statusCode || 502;
+      console.error('browse-catalog error:', err);
+      return res.status(statusCode).json({
+        error: err?.message || 'تعذر جلب كتالوج المنتجات من الخادم.',
+        code: err?.code || 'UPSTREAM_FETCH_ERROR',
+      });
+    }
+  });
+
+  /**
+   * Selective Manual Importer from Supplier Product Browser:
+   * - Requires explicit existing store category per item or defaultCategoryId (NEVER auto-creates categories).
+   * - Prevents duplicates using (providerId, externalProductId, externalVariantId) + exclusive 1-to-1 mappings.
+   * - Supports explicit update of previously imported store products without breaking orders or pricing rules.
+   * - Preserves full description (including Telegram HTML & <tg-emoji>) while scrubbing supplier identity/promo links.
+   */
+  app.post('/api/admin/providers/:id/import-selected', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const providerId = Number(req.params.id);
+      if (!Number.isInteger(providerId) || providerId <= 0) {
+        return res.status(400).json({ error: 'معرف الخادم غير صالح.' });
+      }
+      const [prov] = await db.select().from(providers).where(eq(providers.id, providerId)).limit(1);
+      if (!prov) return res.status(404).json({ error: 'الخادم غير موجود.' });
+
+      const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
+      if (rawItems.length === 0) {
+        return res.status(400).json({ error: 'يرجى تحديد منتج واحد على الأقل للاستيراد.' });
+      }
+      if (rawItems.length > 200) {
+        return res.status(400).json({ error: 'الحد الأقصى للاستيراد في الدفعة الواحدة هو 200 منتج.' });
+      }
+
+      const defaultCategoryId = req.body?.defaultCategoryId ? Number(req.body.defaultCategoryId) : null;
+      const makeVisible = Boolean(req.body?.makeVisible);
+
+      const allCats = await db.select().from(categories);
+      const validCategoryIds = new Set<number>(allCats.map((c) => c.id));
+      if (defaultCategoryId !== null && !validCategoryIds.has(defaultCategoryId)) {
+        return res.status(400).json({ error: 'القسم المستهدف المحدد غير موجود في المتجر.' });
+      }
+
+      registerDynamicSupplierIdentities([prov]);
+      const live = await fetchLiveRichCatalogForProvider(prov, false);
+      const liveByKey = new Map<string, RichNormalizedCatalogItem>();
+      for (const it of live.items) {
+        liveByKey.set(makeSupplierOfferKey(it.externalProductId, it.externalVariantId), it);
+      }
+
+      const touchedStoreProductIds: number[] = [];
+      const results: Array<{
+        externalProductId: string;
+        externalVariantId: string;
+        rawName: string;
+        status: 'created' | 'updated' | 'skipped' | 'failed';
+        storeProductId?: number;
+        message: string;
+      }> = [];
+
+      let createdCount = 0;
+      let updatedCount = 0;
+      let skippedCount = 0;
+      let failedCount = 0;
+
+      await db.transaction(async (tx) => {
+        const existingRows = await tx
+          .select({
+            ppId: providerProducts.id,
+            rawDescription: providerProducts.rawDescription,
+            externalProductId: providerProducts.externalProductId,
+            externalVariantId: providerProducts.externalVariantId,
+            storeProductId: storeProducts.id,
+            storeProductTitle: storeProducts.titleAr,
+            storeCategoryId: storeProducts.categoryId,
+            storeIsVisible: storeProducts.isVisible,
+            storeDescriptionAr: storeProducts.descriptionAr,
+          })
+          .from(providerProducts)
+          .leftJoin(productProviderMappings, eq(productProviderMappings.providerProductId, providerProducts.id))
+          .leftJoin(storeProducts, eq(productProviderMappings.storeProductId, storeProducts.id))
+          .where(eq(providerProducts.providerId, providerId));
+
+        const existingMap = new Map<
+          string,
+          ExistingStoreLinkInfo & { ppRawDescription: string | null }
+        >();
+        for (const row of existingRows) {
+          existingMap.set(makeSupplierOfferKey(row.externalProductId, row.externalVariantId || ''), {
+            providerProductId: row.ppId,
+            storeProductId: row.storeProductId ?? null,
+            storeProductTitle: row.storeProductTitle ?? null,
+            storeCategoryId: row.storeCategoryId ?? null,
+            storeIsVisible: row.storeIsVisible ?? null,
+            storeDescriptionEmpty: !(row.storeDescriptionAr || '').trim(),
+            ppRawDescription: row.rawDescription ?? '',
+          });
+        }
+
+        for (const reqItem of rawItems) {
+          const extId = String(reqItem?.externalProductId || '').trim();
+          const extVarId = String(reqItem?.externalVariantId || '').trim();
+          const itemKey = makeSupplierOfferKey(extId, extVarId);
+          const source = liveByKey.get(itemKey);
+
+          if (!source) {
+            failedCount += 1;
+            results.push({
+              externalProductId: extId,
+              externalVariantId: extVarId,
+              rawName: extId,
+              status: 'failed',
+              message: 'المنتج غير متوفر في كتالوج الخادم الحالي.',
+            });
+            continue;
+          }
+
+          const existingInfo = existingMap.get(itemKey) || null;
+          const browserItem = buildSupplierBrowserItem(source, {
+            extraSupplierNames: [prov.name, prov.code],
+            existingLink: existingInfo,
+          });
+
+          const targetCatId = reqItem?.targetCategoryId ? Number(reqItem.targetCategoryId) : defaultCategoryId;
+          const requestedAction =
+            reqItem?.action === 'update' || reqItem?.action === 'skip' ? reqItem.action : 'create';
+
+          const plan = validateAndPlanSupplierImport({
+            sourceItem: browserItem,
+            requestedCategoryId: targetCatId,
+            validCategoryIds,
+            requestedAction,
+          });
+
+          if (!plan.ok || !plan.targetCategoryId) {
+            if (browserItem.importStatus === 'imported' && plan.action === 'skip') {
+              skippedCount += 1;
+              results.push({
+                externalProductId: extId,
+                externalVariantId: extVarId,
+                rawName: browserItem.rawName,
+                status: 'skipped',
+                storeProductId: browserItem.existingStoreProductId ?? undefined,
+                message: plan.reason || 'مستورد مسبقًا (تم التخطي).',
+              });
+            } else {
+              failedCount += 1;
+              results.push({
+                externalProductId: extId,
+                externalVariantId: extVarId,
+                rawName: browserItem.rawName,
+                status: 'failed',
+                message: plan.reason || 'بيانات الاستيراد غير مكتملة.',
+              });
+            }
+            continue;
+          }
+
+          // Upsert provider_products preserving non-empty descriptions
+          let ppId = existingInfo?.providerProductId;
+          const descForPP = plan.finalDescriptionHtml || existingInfo?.ppRawDescription || '';
+          if (ppId) {
+            await tx
+              .update(providerProducts)
+              .set({
+                rawName: browserItem.rawName,
+                rawDescription: descForPP,
+                wholesalePrice: new Decimal(browserItem.wholesalePrice).toFixed(4),
+                currency: browserItem.currency || 'USD',
+                stockCount: browserItem.stockCount,
+                minQty: browserItem.minQty,
+                maxQty: browserItem.maxQty,
+                deliveryType: browserItem.deliveryType,
+                durationLabel: browserItem.durationLabel || '',
+                warrantyDays: browserItem.warrantyDays,
+                pricingTiersJson: browserItem.pricingTiers ?? null,
+                lastSyncedAt: new Date(),
+              })
+              .where(eq(providerProducts.id, ppId));
+          } else {
+            const [insertedPP] = await tx
+              .insert(providerProducts)
+              .values({
+                providerId,
+                externalProductId: extId,
+                externalVariantId: extVarId,
+                rawName: browserItem.rawName,
+                rawDescription: descForPP,
+                wholesalePrice: new Decimal(browserItem.wholesalePrice).toFixed(4),
+                currency: browserItem.currency || 'USD',
+                stockCount: browserItem.stockCount,
+                minQty: browserItem.minQty,
+                maxQty: browserItem.maxQty,
+                deliveryType: browserItem.deliveryType,
+                durationLabel: browserItem.durationLabel || '',
+                warrantyDays: browserItem.warrantyDays,
+                pricingTiersJson: browserItem.pricingTiers ?? null,
+              })
+              .returning();
+            ppId = insertedPP.id;
+          }
+
+          const warrantyAr =
+            browserItem.warrantyLabel ||
+            (browserItem.warrantyDays > 0 ? `ضمان ${browserItem.warrantyDays} يومًا` : 'ضمان التشغيل الفوري');
+          const warrantyEn =
+            browserItem.warrantyDays > 0 ? `${browserItem.warrantyDays}-day warranty` : 'Instant Activation Warranty';
+
+          if (plan.action === 'update' && browserItem.existingStoreProductId) {
+            const spUpdatePatch: Record<string, any> = {
+              categoryId: plan.targetCategoryId,
+              warrantyDays: browserItem.warrantyDays,
+              warrantyLabelAr: warrantyAr,
+              warrantyLabelEn: warrantyEn,
+              deliveryType: browserItem.deliveryType,
+              updatedAt: new Date(),
+            };
+            if (plan.finalDescriptionHtml) {
+              spUpdatePatch.descriptionAr = plan.finalDescriptionHtml;
+              spUpdatePatch.descriptionEn = plan.finalDescriptionHtml;
+            }
+            if (browserItem.imageUrl) {
+              spUpdatePatch.imageUrl = browserItem.imageUrl;
+            }
+            if (browserItem.durationLabel) {
+              spUpdatePatch.durationLabel = browserItem.durationLabel;
+            }
+            if (browserItem.deliveryInstructions) {
+              spUpdatePatch.deliveryInstructionsAr = browserItem.deliveryInstructions;
+              spUpdatePatch.deliveryInstructionsEn = browserItem.deliveryInstructions;
+            }
+
+            await tx
+              .update(storeProducts)
+              .set(spUpdatePatch)
+              .where(eq(storeProducts.id, browserItem.existingStoreProductId));
+
+            touchedStoreProductIds.push(browserItem.existingStoreProductId);
+            updatedCount += 1;
+            results.push({
+              externalProductId: extId,
+              externalVariantId: extVarId,
+              rawName: browserItem.rawName,
+              status: 'updated',
+              storeProductId: browserItem.existingStoreProductId,
+              message: 'تم تحديث بيانات المنتج والوصف دون إنشاء نسخة مكررة.',
+            });
+            continue;
+          }
+
+          // Create new store product + exclusive 1-to-1 mapping + pricing record
+          const cleanTitle = browserItem.rawName.replace(/\s*\([^)]*\)\s*$/g, '').trim() || browserItem.rawName;
+          const sku = generateUniqueRef('SKU').slice(0, 16);
+          const [newSP] = await tx
+            .insert(storeProducts)
+            .values({
+              sku,
+              categoryId: plan.targetCategoryId,
+              titleAr: cleanTitle,
+              titleEn: cleanTitle,
+              descriptionAr: plan.finalDescriptionHtml,
+              descriptionEn: plan.finalDescriptionHtml,
+              imageUrl: browserItem.imageUrl || '',
+              deliveryInstructionsAr: browserItem.deliveryInstructions || '',
+              deliveryInstructionsEn: browserItem.deliveryInstructions || '',
+              warrantyLabelAr: warrantyAr,
+              warrantyLabelEn: warrantyEn,
+              warrantyDays: browserItem.warrantyDays,
+              durationLabel: browserItem.durationLabel || 'حسب الباقة',
+              deliveryType: browserItem.deliveryType,
+              isVisible: makeVisible,
+              isPaused: false,
+            })
+            .returning();
+
+          await tx.insert(productProviderMappings).values({
+            storeProductId: newSP.id,
+            providerProductId: ppId,
+            roleType: 'primary',
+            priority: 1,
+            selectionStrategy: 'priority',
+            isVerifiedCompatible: true,
+            isActive: true,
+          });
+
+          const wholesaleDec = new Decimal(browserItem.wholesalePrice || '0');
+          const suggestedDec = browserItem.suggestedRetailPrice
+            ? new Decimal(browserItem.suggestedRetailPrice)
+            : null;
+          const initialRetail =
+            suggestedDec && suggestedDec.gt(wholesaleDec)
+              ? suggestedDec.toFixed(4)
+              : wholesaleDec.plus('2.00').toFixed(4);
+
+          await tx.insert(productPrices).values({
+            storeProductId: newSP.id,
+            pricingMode: 'manual',
+            retailPrice: initialRetail,
+            agentPrice: initialRetail,
+            fixedMargin: '2.0000',
+            percentMargin: '100.0000',
+            paymentFeePercent: '1.5000',
+            lockManualPrice: true,
+          });
+
+          touchedStoreProductIds.push(newSP.id);
+          createdCount += 1;
+          existingMap.set(itemKey, {
+            providerProductId: ppId,
+            storeProductId: newSP.id,
+            storeProductTitle: newSP.titleAr,
+            storeCategoryId: newSP.categoryId,
+            storeIsVisible: newSP.isVisible,
+            storeDescriptionEmpty: !plan.finalDescriptionHtml,
+            ppRawDescription: descForPP,
+          });
+          results.push({
+            externalProductId: extId,
+            externalVariantId: extVarId,
+            rawName: browserItem.rawName,
+            status: 'created',
+            storeProductId: newSP.id,
+            message: makeVisible ? 'تم الاستيراد والنشر في المتجر.' : 'تم الاستيراد بنجاح (مخفي حتى المراجعة).',
+          });
+        }
+
+        await tx.insert(auditLogs).values({
+          actorUserId: req.user!.id,
+          actorRole: req.user!.role,
+          action: 'SUPPLIER_PRODUCTS_SELECTIVELY_IMPORTED',
+          entityType: 'provider',
+          entityId: String(providerId),
+          detailsJson: {
+            providerCode: prov.code,
+            createdCount,
+            updatedCount,
+            skippedCount,
+            failedCount,
+          },
+        });
+      });
+
+      for (const spId of touchedStoreProductIds) {
+        await syncStoredEffectiveRetailPrice(spId);
+      }
+
+      return res.json({
+        ok: true,
+        createdCount,
+        updatedCount,
+        skippedCount,
+        failedCount,
+        results,
+        messageAr: `اكتمل الاستيراد من ${prov.name}: ${createdCount} منتج جديد، ${updatedCount} محدث، ${skippedCount} متخطى، ${failedCount} تعذر استيراده.`,
+      });
+    } catch (err: any) {
+      if (err?.code === '23505') {
+        return res.status(409).json({ error: 'أحد المنتجات المحددة مرتبط مسبقًا ولا يمكن تكرار استيراده.' });
+      }
+      console.error('import-selected error:', err);
+      return res.status(err?.statusCode || 500).json({
+        error: err?.message || 'تعذر تنفيذ الاستيراد المحدد من الخادم.',
+      });
+    }
+  });
+
   /**
    * "جلب المنتجات من الخادم"
    * - Fetches real catalog from live provider API if encrypted key is configured,
@@ -1199,9 +1775,12 @@ async function buildApp() {
         rawDescription: string;
         wholesalePrice: string;
         stockCount: number;
+        minQty?: number;
+        maxQty?: number;
         deliveryType: string;
         durationLabel: string;
         warrantyDays: number;
+        pricingTiers?: Array<{ minQty: number; maxQty: number | null; price: string }>;
       }> = [];
 
       let mode: 'live' | 'sandbox' = 'sandbox';
@@ -1252,7 +1831,12 @@ async function buildApp() {
       let priceHikeAlerts = 0;
 
       for (const item of importedItems) {
-        const cleanedSupplierDesc = sanitizeCustomerProductDescription(item.rawDescription);
+        const rawTrimmed = (item.rawDescription || '').trim();
+        const processedSync = processSupplierProductDescription(rawTrimmed, {
+          extraSupplierNames: [prov.name, prov.code],
+        });
+        const cleanedSupplierDesc =
+          processedSync.telegramHtml || (rawTrimmed ? normalizeOriginalTelegramHtmlForPreview(rawTrimmed) : '');
         const existing = await db
           .select()
           .from(providerProducts)
@@ -1273,10 +1857,15 @@ async function buildApp() {
             .update(providerProducts)
             .set({
               rawName: item.rawName,
-              rawDescription: cleanedSupplierDesc,
+              // NEVER overwrite an existing stored description with empty when upstream list omits it!
+              rawDescription: cleanedSupplierDesc || prev.rawDescription || '',
               previousWholesalePrice: oldW,
               wholesalePrice: new Decimal(item.wholesalePrice).toFixed(4),
               stockCount: item.stockCount,
+              minQty: item.minQty || prev.minQty,
+              maxQty: item.maxQty || prev.maxQty,
+              durationLabel: item.durationLabel || prev.durationLabel,
+              pricingTiersJson: item.pricingTiers ?? prev.pricingTiersJson,
               lastSyncedAt: new Date(),
             })
             .where(eq(providerProducts.id, prev.id));
@@ -1756,74 +2345,252 @@ async function buildApp() {
 
       const sku = generateUniqueRef('SKU').slice(0, 16);
 
-      const [created] = await db
-        .insert(storeProducts)
-        .values({
-          sku,
-          categoryId,
-          titleAr,
-          titleEn,
-          descriptionAr: resolvedDesc.textAr,
-          descriptionEn: resolvedDesc.textEn,
-          warrantyLabelAr: resolvedWarranty.textAr || 'ضمان التشغيل طوال المدة',
-          warrantyLabelEn: resolvedWarranty.textEn || 'Full period activation warranty',
-          durationLabel: String(body.durationLabel || 'حسب الباقة').trim(),
-          deliveryType: String(body.deliveryType || 'code').trim(),
-          isVisible: Boolean(body.isVisible),
-          isPaused: false,
-          autoHideOutOfStock: body.autoHideOutOfStock !== false,
-          isFeaturedOffer: Boolean(body.isFeaturedOffer),
-          sortOrder: Number(body.sortOrder || 10),
-        })
-        .returning();
+      const initialProviderIds: number[] = Array.from(
+        new Set(
+          (Array.isArray(body.initialProviderProductIds) ? body.initialProviderProductIds : [])
+            .map(Number)
+            .filter((n: number) => Number.isFinite(n) && n > 0)
+        )
+      );
 
-      await db.insert(productPrices).values({
-        storeProductId: created.id,
-        pricingMode: body.pricingMode === 'fixed_margin' || body.pricingMode === 'percent_margin' ? body.pricingMode : 'manual',
-        retailPrice,
-        agentPrice,
-        fixedMargin: new Decimal(body.fixedMargin || '1.00').toFixed(4),
-        percentMargin: new Decimal(body.percentMargin || '30').toFixed(4),
-        paymentFeePercent: new Decimal(body.paymentFeePercent || '1.5').toFixed(4),
-        extraFixedCost: new Decimal(body.extraFixedCost || '0').toFixed(4),
-        promoPrice: body.promoPrice ? new Decimal(body.promoPrice).toFixed(4) : null,
-        lockManualPrice: true,
-      });
+      const created = await db.transaction(async (tx) => {
+        if (initialProviderIds.length > 0) {
+          const conflicting = await tx
+            .select({
+              providerProductId: productProviderMappings.providerProductId,
+              storeProductId: productProviderMappings.storeProductId,
+              storeTitle: storeProducts.titleAr,
+              offerName: providerProducts.rawName,
+            })
+            .from(productProviderMappings)
+            .innerJoin(storeProducts, eq(productProviderMappings.storeProductId, storeProducts.id))
+            .innerJoin(providerProducts, eq(productProviderMappings.providerProductId, providerProducts.id))
+            .where(inArray(productProviderMappings.providerProductId, initialProviderIds));
 
-      const initialProviderIds: number[] = Array.isArray(body.initialProviderProductIds)
-        ? body.initialProviderProductIds.map(Number).filter((n: number) => Number.isFinite(n) && n > 0)
-        : [];
+          if (conflicting.length > 0) {
+            const first = conflicting[0];
+            const conflictErr = new Error(
+              `العرض «${first.offerName}» مرتبط حاليًا بالمنتج «${first.storeTitle}» ولا يمكن ربطه بأكثر من منتج.`
+            ) as Error & { statusCode?: number };
+            conflictErr.statusCode = 409;
+            throw conflictErr;
+          }
+        }
 
-      for (let i = 0; i < initialProviderIds.length; i++) {
-        await db
-          .insert(productProviderMappings)
+        const [newProduct] = await tx
+          .insert(storeProducts)
           .values({
-            storeProductId: created.id,
+            sku,
+            categoryId,
+            titleAr,
+            titleEn,
+            descriptionAr: resolvedDesc.textAr,
+            descriptionEn: resolvedDesc.textEn,
+            warrantyLabelAr: resolvedWarranty.textAr || 'ضمان التشغيل طوال المدة',
+            warrantyLabelEn: resolvedWarranty.textEn || 'Full period activation warranty',
+            durationLabel: String(body.durationLabel || 'حسب الباقة').trim(),
+            deliveryType: String(body.deliveryType || 'code').trim(),
+            isVisible: Boolean(body.isVisible),
+            isPaused: false,
+            autoHideOutOfStock: body.autoHideOutOfStock !== false,
+            isFeaturedOffer: Boolean(body.isFeaturedOffer),
+            sortOrder: Number(body.sortOrder || 10),
+          })
+          .returning();
+
+        await tx.insert(productPrices).values({
+          storeProductId: newProduct.id,
+          pricingMode:
+            body.pricingMode === 'fixed_margin' || body.pricingMode === 'percent_margin'
+              ? body.pricingMode
+              : 'manual',
+          retailPrice,
+          agentPrice,
+          fixedMargin: new Decimal(body.fixedMargin || '1.00').toFixed(4),
+          percentMargin: new Decimal(body.percentMargin || '30').toFixed(4),
+          paymentFeePercent: new Decimal(body.paymentFeePercent || '1.5').toFixed(4),
+          extraFixedCost: new Decimal(body.extraFixedCost || '0').toFixed(4),
+          promoPrice: body.promoPrice ? new Decimal(body.promoPrice).toFixed(4) : null,
+          lockManualPrice: true,
+        });
+
+        for (let i = 0; i < initialProviderIds.length; i++) {
+          await tx.insert(productProviderMappings).values({
+            storeProductId: newProduct.id,
             providerProductId: initialProviderIds[i],
             roleType: i === 0 ? 'primary' : 'backup',
             priority: i + 1,
             selectionStrategy: 'priority',
             isVerifiedCompatible: true,
             isActive: true,
-          })
-          .onConflictDoNothing();
-      }
+          });
+        }
+
+        await tx.insert(auditLogs).values({
+          actorUserId: req.user!.id,
+          actorRole: req.user!.role,
+          action: 'PRODUCT_CREATED',
+          entityType: 'store_product',
+          entityId: String(newProduct.id),
+          detailsJson: {
+            titleAr,
+            categoryId,
+            retailPrice,
+            agentPrice,
+            linkedProvidersCount: initialProviderIds.length,
+          },
+        });
+
+        return newProduct;
+      });
 
       await syncStoredEffectiveRetailPrice(created.id);
 
-      await db.insert(auditLogs).values({
-        actorUserId: req.user!.id,
-        actorRole: req.user!.role,
-        action: 'PRODUCT_CREATED',
-        entityType: 'store_product',
-        entityId: String(created.id),
-        detailsJson: { titleAr, categoryId, retailPrice, agentPrice, linkedProvidersCount: initialProviderIds.length },
-      });
-
       return res.status(201).json({ ok: true, product: created });
     } catch (err: any) {
+      if (err?.statusCode === 409 || err?.code === '23505') {
+        return res.status(409).json({
+          error:
+            err?.statusCode === 409
+              ? err.message
+              : 'أحد المزودين المختارين مرتبط بالفعل بمنتج آخر ولا يمكن تكرار ربطه.',
+        });
+      }
       console.error('create product error:', err);
       return res.status(500).json({ error: 'تعذر إنشاء المنتج الجديد.' });
+    }
+  });
+
+  // --- Provider-Product Links Audit & Manual Cleanup ---
+  app.get('/api/admin/products/provider-audit', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+    try {
+      const rows = await db
+        .select({
+          mappingId: productProviderMappings.id,
+          storeProductId: storeProducts.id,
+          storeProductTitle: storeProducts.titleAr,
+          storeProductCategoryName: categories.nameAr,
+          storeProductDescription: storeProducts.descriptionAr,
+          storeProductVisible: storeProducts.isVisible,
+          providerProductId: providerProducts.id,
+          providerId: providers.id,
+          providerName: providers.name,
+          providerEnabled: providers.isEnabled,
+          providerStatus: providers.status,
+          providerOfferRawName: providerProducts.rawName,
+          providerOfferDescription: providerProducts.rawDescription,
+          isActiveAtProvider: providerProducts.isActiveAtProvider,
+          wholesalePrice: providerProducts.wholesalePrice,
+          stockCount: providerProducts.stockCount,
+          priority: productProviderMappings.priority,
+          isActiveMapping: productProviderMappings.isActive,
+        })
+        .from(productProviderMappings)
+        .innerJoin(storeProducts, eq(productProviderMappings.storeProductId, storeProducts.id))
+        .leftJoin(categories, eq(storeProducts.categoryId, categories.id))
+        .innerJoin(providerProducts, eq(productProviderMappings.providerProductId, providerProducts.id))
+        .innerJoin(providers, eq(providerProducts.providerId, providers.id))
+        .orderBy(asc(storeProducts.id), asc(productProviderMappings.priority), asc(productProviderMappings.id));
+
+      const records: MappingRecordForAudit[] = rows.map((r) => ({
+        ...r,
+        wholesalePrice: formatMoney(r.wholesalePrice, 2),
+      }));
+
+      const report = auditAllProductMappings(records);
+      return res.json({
+        ok: true,
+        ...report,
+        scannedAt: new Date().toISOString(),
+      });
+    } catch (err) {
+      console.error('provider-audit error:', err);
+      return res.status(500).json({ error: 'تعذر فحص ارتباطات المزودين.' });
+    }
+  });
+
+  app.post('/api/admin/products/provider-audit/cleanup', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+    try {
+      const mappingIds: number[] = Array.from(
+        new Set(
+          (Array.isArray(req.body?.mappingIds) ? req.body.mappingIds : [])
+            .map(Number)
+            .filter((n: number) => Number.isInteger(n) && n > 0)
+        )
+      );
+
+      if (mappingIds.length === 0) {
+        return res.status(400).json({ error: 'يرجى تحديد ارتباط واحد على الأقل لتنظيفه.' });
+      }
+
+      const cleanupResult = await db.transaction(async (tx) => {
+        const deletedRows = await tx
+          .delete(productProviderMappings)
+          .where(inArray(productProviderMappings.id, mappingIds))
+          .returning({
+            id: productProviderMappings.id,
+            storeProductId: productProviderMappings.storeProductId,
+            providerProductId: productProviderMappings.providerProductId,
+          });
+
+        if (deletedRows.length === 0) {
+          return { removedCount: 0, affectedStoreProductIds: [] as number[] };
+        }
+
+        const affectedStoreProductIds = Array.from(
+          new Set(deletedRows.map((r) => r.storeProductId))
+        );
+
+        for (const spId of affectedStoreProductIds) {
+          const remaining = await tx
+            .select({ id: productProviderMappings.id, priority: productProviderMappings.priority })
+            .from(productProviderMappings)
+            .where(eq(productProviderMappings.storeProductId, spId))
+            .orderBy(asc(productProviderMappings.priority), asc(productProviderMappings.id));
+
+          for (let i = 0; i < remaining.length; i++) {
+            await tx
+              .update(productProviderMappings)
+              .set({
+                priority: i + 1,
+                roleType: i === 0 ? 'primary' : 'backup',
+              })
+              .where(eq(productProviderMappings.id, remaining[i].id));
+          }
+        }
+
+        await tx.insert(auditLogs).values({
+          actorUserId: req.user!.id,
+          actorRole: req.user!.role,
+          action: 'PROVIDER_MAPPINGS_AUDIT_CLEANUP',
+          entityType: 'product_provider_mapping',
+          entityId: mappingIds.join(','),
+          detailsJson: {
+            removedCount: deletedRows.length,
+            removedMappingIds: deletedRows.map((d) => d.id),
+            affectedStoreProductIds,
+          },
+        });
+
+        return { removedCount: deletedRows.length, affectedStoreProductIds };
+      });
+
+      if (cleanupResult.removedCount === 0) {
+        return res.status(404).json({ error: 'لم يتم العثور على الارتباطات المحددة أو تمت إزالتها مسبقًا.' });
+      }
+
+      for (const spId of cleanupResult.affectedStoreProductIds) {
+        await syncStoredEffectiveRetailPrice(spId);
+      }
+
+      return res.json({
+        ok: true,
+        removedCount: cleanupResult.removedCount,
+        affectedProductsCount: cleanupResult.affectedStoreProductIds.length,
+      });
+    } catch (err) {
+      console.error('provider-audit cleanup error:', err);
+      return res.status(500).json({ error: 'تعذر تنظيف الارتباطات المحددة.' });
     }
   });
 
@@ -2325,49 +3092,107 @@ async function buildApp() {
   app.post('/api/admin/products/:id/mappings', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
     try {
       const storeProductId = Number(req.params.id);
-      const { providerProductId, roleType, priority, selectionStrategy } = req.body || {};
-      if (!providerProductId) return res.status(400).json({ error: 'يرجى اختيار عرض المزود.' });
+      const { providerProductId: rawProvProdId, roleType, priority, selectionStrategy } = req.body || {};
+      const providerProductId = Number(rawProvProdId);
+      if (!Number.isInteger(storeProductId) || storeProductId <= 0 || !Number.isInteger(providerProductId) || providerProductId <= 0) {
+        return res.status(400).json({ error: 'يرجى اختيار منتج وعرض مزود صالح.' });
+      }
 
-      const existingMappings = await db
-        .select()
-        .from(productProviderMappings)
-        .where(eq(productProviderMappings.storeProductId, storeProductId))
-        .orderBy(asc(productProviderMappings.priority), asc(productProviderMappings.id));
+      const [targetProduct] = await db
+        .select({ id: storeProducts.id, titleAr: storeProducts.titleAr })
+        .from(storeProducts)
+        .where(eq(storeProducts.id, storeProductId))
+        .limit(1);
+      if (!targetProduct) {
+        return res.status(404).json({ error: 'المنتج غير موجود.' });
+      }
 
-      const maxPriority = existingMappings.reduce((max, m) => Math.max(max, m.priority), 0);
-      const assignedPriority =
-        typeof priority === 'number' && priority >= 1 ? Math.floor(priority) : maxPriority + 1;
-      const assignedRole =
-        roleType === 'primary' || roleType === 'backup'
-          ? roleType
-          : assignedPriority === 1
-            ? 'primary'
-            : 'backup';
+      const [targetOffer] = await db
+        .select({ id: providerProducts.id, rawName: providerProducts.rawName })
+        .from(providerProducts)
+        .where(eq(providerProducts.id, providerProductId))
+        .limit(1);
+      if (!targetOffer) {
+        return res.status(404).json({ error: 'عرض المزود غير موجود.' });
+      }
 
-      await db
-        .insert(productProviderMappings)
-        .values({
+      const assignedPriority = await db.transaction(async (tx) => {
+        const existingForOffer = await tx
+          .select({
+            id: productProviderMappings.id,
+            storeProductId: productProviderMappings.storeProductId,
+            providerProductId: productProviderMappings.providerProductId,
+            storeProductTitle: storeProducts.titleAr,
+          })
+          .from(productProviderMappings)
+          .innerJoin(storeProducts, eq(productProviderMappings.storeProductId, storeProducts.id))
+          .where(eq(productProviderMappings.providerProductId, providerProductId));
+
+        const check = validateExclusiveOfferBinding(existingForOffer, storeProductId, providerProductId);
+        if (!check.ok) {
+          const msg =
+            check.code === 'ALREADY_LINKED_SAME_PRODUCT'
+              ? 'هذا العرض مرتبط بالفعل بهذا المنتج.'
+              : `هذا المزود/العرض مرتبط حاليًا بالمنتج «${check.conflictStoreProductTitle}» ولا يمكن ربطه بأكثر من منتج. قم بفك ارتباطه أولًا ثم أعد المحاولة.`;
+          const conflictErr = new Error(msg) as Error & { statusCode?: number };
+          conflictErr.statusCode = 409;
+          throw conflictErr;
+        }
+
+        const existingMappings = await tx
+          .select()
+          .from(productProviderMappings)
+          .where(eq(productProviderMappings.storeProductId, storeProductId))
+          .orderBy(asc(productProviderMappings.priority), asc(productProviderMappings.id));
+
+        const maxPriority = existingMappings.reduce((max, m) => Math.max(max, m.priority), 0);
+        const nextPriority =
+          typeof priority === 'number' && priority >= 1 ? Math.floor(priority) : maxPriority + 1;
+        const assignedRole =
+          roleType === 'primary' || roleType === 'backup'
+            ? roleType
+            : nextPriority === 1
+              ? 'primary'
+              : 'backup';
+
+        await tx.insert(productProviderMappings).values({
           storeProductId,
-          providerProductId: Number(providerProductId),
+          providerProductId,
           roleType: assignedRole,
-          priority: assignedPriority,
+          priority: nextPriority,
           selectionStrategy: selectionStrategy || 'priority',
           isVerifiedCompatible: true,
           isActive: true,
-        })
-        .onConflictDoUpdate({
-          target: [productProviderMappings.storeProductId, productProviderMappings.providerProductId],
-          set: {
+        });
+
+        await tx.insert(auditLogs).values({
+          actorUserId: req.user!.id,
+          actorRole: req.user!.role,
+          action: 'PRODUCT_PROVIDER_LINKED',
+          entityType: 'store_product',
+          entityId: String(storeProductId),
+          detailsJson: {
+            providerProductId,
+            offerRawName: targetOffer.rawName,
+            priority: nextPriority,
             roleType: assignedRole,
-            priority: assignedPriority,
-            selectionStrategy: selectionStrategy || 'priority',
-            isActive: true,
           },
         });
 
+        return nextPriority;
+      });
+
       await syncStoredEffectiveRetailPrice(storeProductId);
       return res.json({ ok: true, priority: assignedPriority });
-    } catch (err) {
+    } catch (err: any) {
+      if (err?.statusCode === 409 || err?.code === '23505') {
+        return res.status(409).json({
+          error:
+            err?.statusCode === 409
+              ? err.message
+              : 'هذا المزود/العرض مرتبط حاليًا بمنتج آخر ولا يمكن تكرار ربطه بأكثر من منتج.',
+        });
+      }
       return res.status(500).json({ error: 'تعذر ربط عرض المزود بالمنتج.' });
     }
   });
@@ -2451,33 +3276,63 @@ async function buildApp() {
     try {
       const storeProductId = Number(req.params.id);
       const mappingId = Number(req.params.mappingId);
-      await db.transaction(async (tx) => {
-        await tx
+      if (!Number.isInteger(storeProductId) || storeProductId <= 0 || !Number.isInteger(mappingId) || mappingId <= 0) {
+        return res.status(400).json({ error: 'معرّف الربط غير صالح.' });
+      }
+
+      const deleted = await db.transaction(async (tx) => {
+        const [removed] = await tx
           .delete(productProviderMappings)
           .where(
             and(
               eq(productProviderMappings.id, mappingId),
               eq(productProviderMappings.storeProductId, storeProductId)
             )
-          );
+          )
+          .returning();
+
+        if (!removed) return null;
+
         // Re-compact remaining provider priorities cleanly (1, 2, 3...) with #1 as primary
         const remaining = await tx
-          .select()
+          .select({ id: productProviderMappings.id, priority: productProviderMappings.priority })
           .from(productProviderMappings)
           .where(eq(productProviderMappings.storeProductId, storeProductId))
           .orderBy(asc(productProviderMappings.priority), asc(productProviderMappings.id));
-        for (let i = 0; i < remaining.length; i++) {
+
+        const recompacted = computeRecompactedPriorities(remaining, removed.id);
+        for (const item of recompacted) {
           await tx
             .update(productProviderMappings)
             .set({
-              priority: i + 1,
-              roleType: i === 0 ? 'primary' : 'backup',
+              priority: item.priority,
+              roleType: item.roleType,
             })
-            .where(eq(productProviderMappings.id, remaining[i].id));
+            .where(eq(productProviderMappings.id, item.id));
         }
+
+        await tx.insert(auditLogs).values({
+          actorUserId: req.user!.id,
+          actorRole: req.user!.role,
+          action: 'PRODUCT_PROVIDER_UNLINKED',
+          entityType: 'store_product',
+          entityId: String(storeProductId),
+          detailsJson: {
+            removedMappingId: removed.id,
+            providerProductId: removed.providerProductId,
+            remainingCount: recompacted.length,
+          },
+        });
+
+        return removed;
       });
+
+      if (!deleted) {
+        return res.status(404).json({ error: 'الارتباط المطلوب غير موجود أو تم فك ارتباطه مسبقًا.' });
+      }
+
       await syncStoredEffectiveRetailPrice(storeProductId);
-      return res.json({ ok: true });
+      return res.json({ ok: true, unlinkedMappingId: deleted.id, providerProductId: deleted.providerProductId });
     } catch (err) {
       return res.status(500).json({ error: 'تعذر فك ارتباط عرض المزود.' });
     }
@@ -5119,12 +5974,18 @@ async function buildApp() {
 
               if (existing.length > 0) {
                 const prev = existing[0];
+                const backfilledDesc =
+                  !(prev.rawDescription || '').trim() && (item.rawDescription || '').trim()
+                    ? sanitizeCustomerProductDescription(item.rawDescription) ||
+                      normalizeOriginalTelegramHtmlForPreview(item.rawDescription)
+                    : prev.rawDescription;
                 await db
                   .update(providerProducts)
                   .set({
                     previousWholesalePrice: prev.wholesalePrice,
                     wholesalePrice: new Decimal(item.wholesalePrice).toFixed(4),
                     stockCount: item.stockCount,
+                    rawDescription: backfilledDesc || '',
                     lastSyncedAt: new Date(),
                   })
                   .where(eq(providerProducts.id, prev.id));

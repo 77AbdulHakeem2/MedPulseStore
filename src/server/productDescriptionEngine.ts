@@ -387,36 +387,106 @@ const DESCRIPTION_CANDIDATE_KEYS = [
   'description_html',
   'html_description',
   'telegram_description',
-  'description',
-  'long_description',
+  'descriptionHtml',
   'full_description',
+  'long_description',
   'product_description',
+  'service_description',
+  'description',
+  'description_ar',
+  'description_en',
+  'desc_ar',
+  'desc_en',
+  'details_html',
   'details',
+  'detail',
   'desc',
+  'content',
+  'body',
+  'overview',
   'info',
+  'information',
+  'activation_instructions',
+  'activation_guide',
   'instructions',
   'guide',
+  'usage',
+  'how_to_use',
+  'terms',
   'short_description',
+  'short_description_ar',
+  'short_description_en',
   'summary',
   'custom_pricing_note',
+  'notes',
   'note',
+  'readme',
 ] as const;
+
+function synthesizeSpecsOrFeaturesDescription(src: Record<string, any>): string {
+  const sections: string[] = [];
+  const featureArrays = [src.features, src.highlights, src.benefits, src.requirements, src.specs, src.specifications];
+  for (const cand of featureArrays) {
+    if (Array.isArray(cand) && cand.length > 0) {
+      const lines = cand
+        .map((entry) => {
+          if (typeof entry === 'string') return entry.trim();
+          if (entry && typeof entry === 'object') {
+            const k = entry.label ?? entry.name ?? entry.title ?? entry.key;
+            const v = entry.value ?? entry.text ?? entry.description;
+            if (k && v) return `${String(k).trim()}: ${String(v).trim()}`;
+            return coerceDescriptionField(entry);
+          }
+          return '';
+        })
+        .filter(Boolean);
+      if (lines.length > 0) {
+        sections.push(lines.map((l) => (l.startsWith('•') || l.startsWith('-') ? l : `• ${l}`)).join('\n'));
+      }
+    } else if (cand && typeof cand === 'object' && !Array.isArray(cand)) {
+      const entries = Object.entries(cand as Record<string, unknown>)
+        .filter(([, v]) => v !== null && v !== undefined && String(v).trim() !== '')
+        .map(([k, v]) => `• ${k}: ${typeof v === 'object' ? JSON.stringify(v) : String(v).trim()}`);
+      if (entries.length > 0) {
+        sections.push(entries.join('\n'));
+      }
+    }
+  }
+  return sections.join('\n\n').trim();
+}
 
 /**
  * Extracts the richest product description from ANY supplier API item payload
- * (supporting nested variant objects, HTML fields, arrays, and localized objects).
+ * (supporting nested variant/meta/attributes objects, HTML fields, arrays, localized objects, and features).
  */
 export function extractSupplierRawDescription(
   item: Record<string, any> | null | undefined,
   parentItem?: Record<string, any> | null
 ): string {
-  const sources = [item, parentItem].filter((s): s is Record<string, any> => Boolean(s && typeof s === 'object'));
-  for (const src of sources) {
+  const directSources = [item, parentItem].filter((s): s is Record<string, any> => Boolean(s && typeof s === 'object'));
+  const expandedSources: Record<string, any>[] = [];
+  for (const src of directSources) {
+    expandedSources.push(src);
+    for (const nestedKey of ['attributes', 'meta', 'metadata', 'product', 'service', 'details', 'info']) {
+      const nested = src[nestedKey];
+      if (nested && typeof nested === 'object' && !Array.isArray(nested)) {
+        expandedSources.push(nested as Record<string, any>);
+      }
+    }
+  }
+
+  for (const src of expandedSources) {
     for (const key of DESCRIPTION_CANDIDATE_KEYS) {
       const candidate = coerceDescriptionField(src[key]);
       if (candidate) return candidate;
     }
   }
+
+  for (const src of expandedSources) {
+    const synthesized = synthesizeSpecsOrFeaturesDescription(src);
+    if (synthesized) return synthesized;
+  }
+
   return '';
 }
 
@@ -428,7 +498,7 @@ const PROMO_LINK_ANCHOR_OR_CONTEXT_RE =
   /(?:visit\s+(?:our\s+)?(?:store|shop|website|site|bot|channel)|join\s+(?:our\s+)?(?:telegram\s+)?(?:channel|group|community)|contact\s+(?:supplier|seller|support|us|admin)|powered\s+by|order\s+(?:from|at|on)\s+(?:our\s+)?(?:website|store|shop|bot)|buy\s+(?:more|now|here|from\s+us)|our\s+(?:official\s+)?(?:store|shop|channel|website|bot)|reseller\s+(?:api|panel|portal)|wholesale|زوروا\s+متجرنا|زيارة\s+متجرنا|انضم\s+(?:إلى\s+|الى\s+)?قناتنا|تواصل\s+مع\s+المورد|اطلب\s+من\s+موقعنا|قناتنا\s+على\s+تيليجرام|متجر\s+المورد|للمزيد\s+من\s+المنتجات)/i;
 
 const STANDALONE_PROMO_LINE_RE =
-  /^\s*(?:[\p{Extended_Pictographic}\uFE0F\u200D•·\-—–*🔥💎🚀⚡🛒📢📣🌐💬📲👉👇✨©®]+\s*)*(?:visit\s+(?:our\s+)?(?:store|shop|website|site)|join\s+(?:our\s+)?(?:telegram\s+)?(?:channel|group|community)|follow\s+(?:our\s+)?(?:channel|page)|contact\s+(?:supplier|seller|us\s+on\s+telegram|support\s+at\s+@|@)|powered\s+by\b|provided\s+by\b|supplied\s+by\b|brought\s+to\s+you\s+by\b|sold\s+by\b|order\s+(?:from|at|on)\s+(?:our\s+)?(?:website|store|shop|bot)|buy\s+(?:more|directly)\s+(?:at|from)\b|for\s+(?:bulk|wholesale|reseller)\s+(?:orders?|pricing|api)|reseller\s+api\b|official\s+(?:channel|bot|store)\s*:|updates?\s+channel\s*:|supplier\s+(?:channel|support|store|website)\s*:|©\s*\d{4}?\s*.*(?:store|shop|hub|digital)|زوروا\s+متجرنا|اطلب\s+من\s+موقعنا|انضم\s+(?:إلى\s+|الى\s+)?قناتنا|قناتنا\s+(?:الرسمية|على\s+تيليجرام)|تواصل\s+مع\s+المورد|بواسطة\s+(?:متجر|خادم)|مقدم\s+من\s+(?:متجر|شركة))/iu;
+  /^\s*[\p{Extended_Pictographic}\uFE0F\u200D\s•·\-—–*🔥💎🚀⚡🛒📢📣🌐💬📲👉👇✨©®]*(?:visit\s+(?:our\s+)?(?:store|shop|website|site)|join\s+(?:our\s+)?(?:telegram\s+)?(?:channel|group|community)|follow\s+(?:our\s+)?(?:channel|page)|contact\s+(?:supplier|seller|us\s+on\s+telegram|support\s+at\s+@|@)|powered\s+by\b|provided\s+by\b|supplied\s+by\b|brought\s+to\s+you\s+by\b|sold\s+by\b|order\s+(?:from|at|on)\s+(?:our\s+)?(?:website|store|shop|bot)|buy\s+(?:more|directly)\s+(?:at|from)\b|for\s+(?:bulk|wholesale|reseller)\s+(?:orders?|pricing|api)|reseller\s+api\b|official\s+(?:channel|bot|store)\s*:|updates?\s+channel\s*:|supplier\s+(?:channel|support|store|website)\s*:|©\s*\d{4}?\s*.*(?:store|shop|hub|digital)|زوروا\s+متجرنا|اطلب\s+من\s+موقعنا|انضم\s+(?:إلى\s+|الى\s+)?قناتنا|قناتنا\s+(?:الرسمية|على\s+تيليجرام)|تواصل\s+مع\s+المورد|بواسطة\s+(?:متجر|خادم)|مقدم\s+من\s+(?:متجر|شركة))/iu;
 
 const INTERNAL_ADMIN_NOTICE_LINE_RE =
   /(?:منتج\s*مستورد\s*تلقائي(?:ًا|ا)?\s*من\s*(?:الخادم|المزود|السيرفر)|مخفي\s*افتراضي(?:ًا|ا)?\s*حتى\s*التفعيل(?:\s*والتسعير)?|مستورد\s*تلقائي(?:ًا|ا)?\s*من\s*(?:الخادم|المزود|السيرفر)|مخفي\s*افتراضي(?:ًا|ا)?|حتى\s*التفعيل\s*والتسعير|ملاحظة\s*إدارية\s*داخلية|خاص\s*بالإدارة\s*فقط|للمسؤول\s*فقط|auto[-\s]*imported\s*from\s*(?:the\s*)?(?:server|provider|supplier)|hidden\s*by\s*default\s*(?:until|pending)\s*(?:activation|pricing|review)|pending\s*(?:admin\s*)?activation\s*(?:and|&)\s*pricing|internal\s*(?:admin|system)\s*note|for\s*admin\s*only)/i;
@@ -801,9 +871,8 @@ function parseAndRepairToTelegramAst(
     }
   };
 
-  // Tokenize tags vs text — only recognize genuine HTML tags starting with `<letter` or `</letter`
-  // so mathematical expressions like `price < 5` or `<email>` aren't broken!
-  const tagTokenRe = /<(\/?)([a-zA-Z][a-zA-Z0-9-]*)(\s+(?:[^"'<>]|"[^"]*"|'[^']*')*)?\s*(\/?)>/g;
+  // Tokenize tags vs text with a zero-backtracking linear pattern (disjoint char classes, bounded length)
+  const tagTokenRe = /<(\/?)([a-zA-Z][a-zA-Z0-9-]{0,30})((?:"[^"]*"|'[^']*'|[^"'<>]){0,600})>/g;
 
   let cursor = 0;
   let match: RegExpExecArray | null;
@@ -812,8 +881,16 @@ function parseAndRepairToTelegramAst(
     const fullMatch = match[0];
     const isClosing = match[1] === '/';
     const rawName = match[2].toLowerCase();
-    const attrStr = match[3] || '';
-    const isSelfClosing = match[4] === '/';
+    const rawBetween = match[3] || '';
+
+    if (rawBetween && !/^[\s/]/.test(rawBetween)) {
+      pushText(cleaned.slice(cursor, match.index + fullMatch.length));
+      cursor = match.index + fullMatch.length;
+      continue;
+    }
+
+    const isSelfClosing = !isClosing && /\/\s*$/.test(rawBetween);
+    const attrStr = isSelfClosing ? rawBetween.replace(/\s*\/\s*$/, '') : rawBetween;
 
     if (match.index > cursor) {
       pushText(cleaned.slice(cursor, match.index));
@@ -883,8 +960,8 @@ function parseAndRepairToTelegramAst(
         continue;
       }
 
-      if (isSelfClosing) {
-        // Telegram does not allow self-closing formatting tags
+      if (isSelfClosing && tagName !== 'tg-emoji') {
+        // Telegram does not allow self-closing formatting tags (except empty supplier <tg-emoji /> which we fill with ✨)
         continue;
       }
 
@@ -898,10 +975,16 @@ function parseAndRepairToTelegramAst(
       }
 
       if (tagName === 'tg-emoji') {
-        const emojiId = (attrs['emoji-id'] || '').trim();
-        // Telegram custom emoji IDs are strictly 64-bit numeric strings (typically 15–20 digits)
-        if (/^\d{8,25}$/.test(emojiId)) {
+        const emojiId = (attrs['emoji-id'] || attrs['custom_emoji_id'] || '').trim();
+        // Telegram custom emoji IDs are numeric 64-bit IDs (typically 15–20 digits, allow 5–25 digits)
+        if (/^\d{5,25}$/.test(emojiId)) {
           openTag('tg-emoji', { 'emoji-id': emojiId });
+          if (isSelfClosing) {
+            pushText('✨');
+            closeTag('tg-emoji');
+          }
+        } else if (isSelfClosing) {
+          pushText('✨');
         }
         // If invalid emoji-id, skip opening the tag so fallback inner emoji renders cleanly!
         continue;
@@ -1240,19 +1323,21 @@ function serializeAstToTelegramHtml(node: HtmlNode, allowCustomEmoji: boolean): 
 
   if (!node.tag) return childrenHtml;
 
+  // Never prune <tg-emoji emoji-id="..."> even if supplier sent empty inner text — supply safe ✨ fallback!
+  if (node.tag === 'tg-emoji') {
+    const emojiId = node.attrs?.['emoji-id'];
+    const safeInner = childrenHtml.replace(/<[^>]+>/g, '').trim() ? childrenHtml : '✨';
+    if (!allowCustomEmoji || !emojiId || !/^\d{5,25}$/.test(emojiId)) {
+      return safeInner;
+    }
+    return `<tg-emoji emoji-id="${emojiId}">${safeInner}</tg-emoji>`;
+  }
+
   // Prune empty formatting tags (never send <b></b> or <blockquote> </blockquote> to Telegram!)
   const visibleContent = childrenHtml.replace(/<[^>]+>/g, '').trim();
   if (!visibleContent) {
     // Preserve newlines if they were inside an empty block
     return childrenHtml.includes('\n') ? '\n' : '';
-  }
-
-  if (node.tag === 'tg-emoji') {
-    const emojiId = node.attrs?.['emoji-id'];
-    if (!allowCustomEmoji || !emojiId || !/^\d{8,25}$/.test(emojiId)) {
-      return childrenHtml;
-    }
-    return `<tg-emoji emoji-id="${emojiId}">${childrenHtml}</tg-emoji>`;
   }
 
   if (node.tag === 'a') {
@@ -1276,12 +1361,53 @@ function serializeAstToTelegramHtml(node: HtmlNode, allowCustomEmoji: boolean): 
 }
 
 /**
+ * Extracts unique ordered Telegram custom emoji IDs from sanitized or raw HTML.
+ */
+export function extractCustomEmojiIds(html: string | null | undefined): string[] {
+  if (!html) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  const re = /<tg-emoji\b[^>]*(?:emoji-id|custom_emoji_id)\s*=\s*(?:"(\d{5,25})"|'(\d{5,25})')[^>]*>/gi;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    const id = (m[1] || m[2] || '').trim();
+    if (id && !seen.has(id)) {
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return out;
+}
+
+/**
+ * Unwraps ONLY `<tg-emoji>` tags whose `emoji-id` is NOT in `validIds` to their Unicode fallback,
+ * keeping all other valid `<tg-emoji>` tags and Telegram HTML formatting 100% intact.
+ */
+export function replaceDisallowedCustomEmojis(html: string, validIds: Set<string>): string {
+  if (!html) return '';
+  return html.replace(
+    /<tg-emoji\b([^>]*)>([\s\S]*?)<\/tg-emoji>/gi,
+    (full, attrStr: string, inner: string) => {
+      const idMatch = attrStr.match(/(?:emoji-id|custom_emoji_id)\s*=\s*(?:"(\d{5,25})"|'(\d{5,25})')/i);
+      const id = (idMatch?.[1] || idMatch?.[2] || '').trim();
+      if (id && validIds.has(id)) {
+        return full;
+      }
+      const cleanInner = inner.replace(/<[^>]+>/g, '').trim();
+      return cleanInner ? inner : '✨';
+    }
+  );
+}
+
+/**
  * Unwraps `<tg-emoji emoji-id="...">X</tg-emoji>` to its Unicode fallback `X` while
  * keeping ALL other Telegram HTML formatting (`<blockquote>`, `<b>`, `<i>`, `<a>`, `<code>`) intact.
  */
 export function stripTgEmojiTagsKeepFallback(html: string): string {
   if (!html) return '';
-  return html.replace(/<tg-emoji\b[^>]*>([\s\S]*?)<\/tg-emoji>/gi, '$1');
+  return html.replace(/<tg-emoji\b[^>]*>([\s\S]*?)<\/tg-emoji>/gi, (_full, inner: string) =>
+    inner.replace(/<[^>]+>/g, '').trim() ? inner : '✨'
+  );
 }
 
 /**
@@ -1318,7 +1444,7 @@ export function truncateTelegramHtmlSafely(html: string, maxVisibleChars: number
   if (plain.length <= maxVisibleChars) return html;
 
   const limit = Math.max(40, maxVisibleChars - 3);
-  const tagRe = /(<\/?[a-zA-Z][a-zA-Z0-9-]*(?:\s+[^>]*)?>)/g;
+  const tagRe = /(<\/?[a-zA-Z][a-zA-Z0-9-]{0,30}(?:\s[^<>]{0,600})?>)/g;
   const parts = html.split(tagRe);
   const openStack: string[] = [];
   let visibleCount = 0;
@@ -1464,4 +1590,164 @@ export function processSupplierProductDescription(
     removedLinks: dedupRemoved,
     removedSupplierLinesCount: scrubbed.removedCount,
   };
+}
+
+function validateSafePreviewLinksInAst(node: HtmlNode): void {
+  if (!node.children || node.children.length === 0) return;
+  const nextChildren: HtmlNode[] = [];
+  for (const child of node.children) {
+    if (child.type === 'element' && child.tag === 'a') {
+      const href = decodeBasicHtmlEntities(child.attrs?.href || '').trim();
+      let safeHref: string | null = null;
+      try {
+        const parsed = new URL(href);
+        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+          safeHref = parsed.toString();
+        }
+      } catch {
+        safeHref = null;
+      }
+      if (safeHref) {
+        child.attrs = { href: safeHref };
+        validateSafePreviewLinksInAst(child);
+        nextChildren.push(child);
+      } else {
+        const txt = getNodePlainText(child).trim();
+        if (txt) nextChildren.push({ type: 'text', text: txt });
+      }
+      continue;
+    }
+    if (child.type === 'element') {
+      validateSafePreviewLinksInAst(child);
+    }
+    nextChildren.push(child);
+  }
+  node.children = nextChildren;
+}
+
+/**
+ * Normalizes an original supplier description for pre-import Admin Preview ONLY:
+ * - Strips dangerous XSS tags (<script>, <iframe>, <style>, etc.) and non-http(s) links.
+ * - Repairs broken HTML / decodes double-encoded tags into clean Telegram HTML.
+ * - Preserves 100% of original supplier content, links, <blockquote>, formatting, and <tg-emoji>
+ *   so the admin can inspect the product exactly as it exists at the upstream server before importing.
+ */
+export function normalizeOriginalTelegramHtmlForPreview(rawInput: string | null | undefined): string {
+  const original = (rawInput || '').replace(/\r\n/g, '\n').replace(/\r/g, '\n').trim();
+  if (!original) return '';
+  const detected = detectDescriptionFormat(original);
+  const workingSource = detected === 'encoded_html' ? decodeBasicHtmlEntities(original) : original;
+  let cleaned = workingSource.replace(/<!--[\s\S]*?-->/g, '');
+  for (const tag of STRIP_CONTENT_TAGS) {
+    cleaned = cleaned.replace(new RegExp(`<${tag}\\b[^>]*>[\\s\\S]*?<\\/${tag}>`, 'gi'), '');
+    cleaned = cleaned.replace(new RegExp(`<${tag}\\b[^>]*\\/?>`, 'gi'), '');
+  }
+  return serializeRawPreviewAst(cleaned);
+}
+
+function serializeRawPreviewAst(cleaned: string): string {
+  const root: HtmlNode = { type: 'element', tag: undefined, children: [] };
+  const stack: HtmlNode[] = [root];
+  const currentParent = () => stack[stack.length - 1];
+  const pushText = (t: string) => {
+    if (t) currentParent().children!.push({ type: 'text', text: t });
+  };
+  const hasOpenTag = (tagName: TgTagName): boolean => {
+    for (let i = stack.length - 1; i >= 1; i--) {
+      if (stack[i].tag === tagName) return true;
+    }
+    return false;
+  };
+  const openTag = (tag: TgTagName, attrs: Record<string, string> = {}) => {
+    if (tag === 'blockquote' && hasOpenTag('blockquote')) {
+      pushText('\n');
+      return;
+    }
+    if (tag === 'a' && hasOpenTag('a')) return;
+    if (hasOpenTag('pre') && tag !== 'code') return;
+    if (hasOpenTag('code')) return;
+    const node: HtmlNode = { type: 'element', tag, attrs, children: [] };
+    currentParent().children!.push(node);
+    stack.push(node);
+  };
+  const closeTag = (tag: TgTagName) => {
+    let matchIdx = -1;
+    for (let i = stack.length - 1; i >= 1; i--) {
+      if (stack[i].tag === tag) {
+        matchIdx = i;
+        break;
+      }
+    }
+    if (matchIdx === -1) return;
+    while (stack.length - 1 >= matchIdx) stack.pop();
+  };
+
+  const tagTokenRe = /<(\/?)([a-zA-Z][a-zA-Z0-9-]{0,30})((?:"[^"]*"|'[^']*'|[^"'<>]){0,600})>/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = tagTokenRe.exec(cleaned)) !== null) {
+    const fullMatch = match[0];
+    const isClosing = match[1] === '/';
+    const rawName = match[2].toLowerCase();
+    const rawBetween = match[3] || '';
+    if (rawBetween && !/^[\s/]/.test(rawBetween)) {
+      pushText(cleaned.slice(cursor, match.index + fullMatch.length));
+      cursor = match.index + fullMatch.length;
+      continue;
+    }
+    if (match.index > cursor) pushText(cleaned.slice(cursor, match.index));
+    cursor = match.index + fullMatch.length;
+    const isSelfClosing = !isClosing && /\/\s*$/.test(rawBetween);
+    const attrStr = isSelfClosing ? rawBetween.replace(/\s*\/\s*$/, '') : rawBetween;
+    if (rawName === 'br') { pushText('\n'); continue; }
+    if (rawName === 'hr') { pushText('\n━━━━━━━━━━━━━━\n'); continue; }
+    if (rawName === 'li') { pushText(!isClosing ? '\n• ' : '\n'); continue; }
+    if (HEADING_TAGS.has(rawName)) {
+      if (!isClosing) { pushText('\n'); openTag('b'); } else { closeTag('b'); pushText('\n'); }
+      continue;
+    }
+    if (BLOCK_NEWLINE_TAGS.has(rawName)) { if (isClosing) pushText('\n'); continue; }
+    if (rawName === 'span') {
+      if (!isClosing) {
+        const attrs = parseTagAttributes(attrStr);
+        if ((attrs.class || '').toLowerCase().split(/\s+/).includes('tg-spoiler')) openTag('tg-spoiler');
+      } else if (hasOpenTag('tg-spoiler')) closeTag('tg-spoiler');
+      continue;
+    }
+    if (SUPPORTED_TG_TAGS.has(rawName)) {
+      const tagName = rawName as TgTagName;
+      if (isClosing) { closeTag(tagName); continue; }
+      if (isSelfClosing && tagName !== 'tg-emoji') continue;
+      const attrs = parseTagAttributes(attrStr);
+      if (tagName === 'blockquote') {
+        openTag('blockquote', 'expandable' in attrs || /\bexpandable\b/i.test(attrStr) ? { expandable: 'true' } : {});
+        continue;
+      }
+      if (tagName === 'tg-emoji') {
+        const emojiId = (attrs['emoji-id'] || attrs['custom_emoji_id'] || '').trim();
+        if (/^\d{5,25}$/.test(emojiId)) {
+          openTag('tg-emoji', { 'emoji-id': emojiId });
+          if (isSelfClosing) { pushText('✨'); closeTag('tg-emoji'); }
+        } else if (isSelfClosing) pushText('✨');
+        continue;
+      }
+      if (tagName === 'a') {
+        const href = (attrs.href || '').trim();
+        if (href) openTag('a', { href });
+        continue;
+      }
+      if (tagName === 'code') {
+        const langMatch = (attrs.class || '').trim().match(/\blanguage-([a-zA-Z0-9_+#.-]{1,30})\b/);
+        openTag('code', langMatch && hasOpenTag('pre') ? { class: `language-${langMatch[1]}` } : {});
+        continue;
+      }
+      openTag(tagName);
+    }
+  }
+  if (cursor < cleaned.length) pushText(cleaned.slice(cursor));
+  validateSafePreviewLinksInAst(root);
+  return serializeAstToTelegramHtml(root, true)
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }

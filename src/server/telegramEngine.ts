@@ -37,9 +37,17 @@ import {
   type CustomerInlineButton,
 } from './sanitizer.ts';
 import {
+  extractCustomEmojiIds,
   stripTelegramHtmlToPlainText,
   stripTgEmojiTagsKeepFallback,
 } from './productDescriptionEngine.ts';
+import {
+  filterValidCustomEmojisInHtml,
+  getBotCustomEmojiCapability,
+  recordBotCustomEmojiOutcome,
+  resetBotCustomEmojiCapability,
+  type CustomEmojiCapabilityStatus,
+} from './customEmojiService.ts';
 import { getLiveCustomerCatalog } from './catalogService.ts';
 import { formatMoney } from './pricing.ts';
 import { ensureUserWallet, creditDepositAtomically } from './walletEngine.ts';
@@ -2642,6 +2650,7 @@ export interface TelegramBotRuntimeStatus {
   startedAt: string | null;
   updatesReceived: number;
   lastUpdateAt: string | null;
+  customEmojiCapability?: CustomEmojiCapabilityStatus;
 }
 
 interface StoredTelegramConfig {
@@ -2668,6 +2677,12 @@ let runtimeState: TelegramBotRuntimeStatus = {
   updatesReceived: 0,
   lastUpdateAt: null,
 };
+
+export async function getActiveTelegramBotToken(): Promise<string | null> {
+  if (activeTokenUsed) return activeTokenUsed;
+  const resolved = await resolveTelegramConfigFromDbAndEnv();
+  return resolved.token || null;
+}
 
 function buildTelegramInlineMarkup(
   rows: BotInlineButton[][],
@@ -2796,12 +2811,21 @@ function createConfiguredGrammyBot(token: string): Bot {
       return opts;
     };
 
+    // Pre-validate individual <tg-emoji emoji-id="..."> IDs via getCustomEmojiStickers
+    // so only broken/missing custom emojis downgrade to fallback while working ones render in full design!
+    let candidateHtml = reply.text;
+    if (useHtml && extractCustomEmojiIds(reply.text).length > 0) {
+      const filtered = await filterValidCustomEmojisInHtml(reply.text, token);
+      candidateHtml = filtered.html;
+    }
+
+    const htmlHasCustomEmoji = useHtml && extractCustomEmojiIds(candidateHtml).length > 0;
     const htmlNoEmojiText = useHtml
-      ? reply.htmlNoCustomEmojiFallback || stripTgEmojiTagsKeepFallback(reply.text)
-      : reply.text;
+      ? reply.htmlNoCustomEmojiFallback || stripTgEmojiTagsKeepFallback(candidateHtml)
+      : candidateHtml;
     const plainFallbackText = useHtml
-      ? reply.plainFallbackText || stripTelegramHtmlToPlainText(reply.text)
-      : reply.text;
+      ? reply.plainFallbackText || stripTelegramHtmlToPlainText(candidateHtml)
+      : candidateHtml;
 
     const isNotModifiedError = (e: any) =>
       /message is not modified/i.test(String(e?.description || e?.message || ''));
@@ -2809,34 +2833,44 @@ function createConfiguredGrammyBot(token: string): Bot {
       /can't parse entities|unsupported start tag|unexpected end tag|custom emoji|DOCUMENT_INVALID|ENTITY_/i.test(
         String(e?.description || e?.message || '')
       );
+    const isCustomEmojiRejectionError = (e: any) =>
+      /custom[_ ]?emoji|DOCUMENT_INVALID|ENTITY_/i.test(String(e?.description || e?.message || ''));
 
     const deliverVia = async (method: 'edit' | 'reply'): Promise<boolean> => {
       const exec = (txt: string, opts: Record<string, any>) =>
         method === 'edit' ? ctx.editMessageText(txt, opts) : ctx.reply(txt, opts);
 
       if (useHtml) {
-        // 1. Primary: Full Telegram HTML (including <tg-emoji>) + extended buttons
+        // 1. Primary: Full Telegram HTML (including verified <tg-emoji>) + extended buttons
         try {
-          await exec(reply.text, buildOpts(true, false, 'HTML'));
+          await exec(candidateHtml, buildOpts(true, false, 'HTML'));
+          if (htmlHasCustomEmoji) recordBotCustomEmojiOutcome(true);
           return true;
         } catch (err1: any) {
           if (method === 'edit' && isNotModifiedError(err1)) return true;
 
-          // 2. Retry HTML with standard buttons (if button style/icon rejected) OR without <tg-emoji> (if custom emoji rejected)
-          const tryNoEmojiFirst = isHtmlOrEmojiParseError(err1) && htmlNoEmojiText !== reply.text;
+          // 2. Retry HTML with standard buttons OR without <tg-emoji> (if custom emoji rejected)
+          const tryNoEmojiFirst = isHtmlOrEmojiParseError(err1) && htmlNoEmojiText !== candidateHtml;
+          if (tryNoEmojiFirst && isCustomEmojiRejectionError(err1)) {
+            recordBotCustomEmojiOutcome(false);
+          }
           try {
             await exec(
-              tryNoEmojiFirst ? htmlNoEmojiText : reply.text,
+              tryNoEmojiFirst ? htmlNoEmojiText : candidateHtml,
               buildOpts(tryNoEmojiFirst, false, 'HTML')
             );
+            if (!tryNoEmojiFirst && htmlHasCustomEmoji) recordBotCustomEmojiOutcome(true);
             return true;
           } catch (err2: any) {
             if (method === 'edit' && isNotModifiedError(err2)) return true;
 
             // 3. Retry HTML without <tg-emoji> AND standard buttons (keeps <blockquote>, <b>, <i>, <a>, <code> intact!)
-            if (htmlNoEmojiText !== reply.text) {
+            if (htmlNoEmojiText !== candidateHtml) {
               try {
                 await exec(htmlNoEmojiText, buildOpts(false, false, 'HTML'));
+                if (isCustomEmojiRejectionError(err1) || isCustomEmojiRejectionError(err2)) {
+                  recordBotCustomEmojiOutcome(false);
+                }
                 return true;
               } catch (err3: any) {
                 if (method === 'edit' && isNotModifiedError(err3)) return true;
@@ -3008,6 +3042,7 @@ export async function getTelegramBotRuntimeStatus(): Promise<TelegramBotRuntimeS
     tokenFingerprint: resolved.tokenFingerprint,
     ownerTelegramIds: resolved.ownerTelegramIds,
     state: resolved.token ? runtimeState.state : 'not_configured',
+    customEmojiCapability: getBotCustomEmojiCapability(),
   };
 }
 
@@ -3016,6 +3051,7 @@ export async function startOrRestartTelegramBot(): Promise<{
   messageAr: string;
   status: TelegramBotRuntimeStatus;
 }> {
+  resetBotCustomEmojiCapability();
   const resolved = await resolveTelegramConfigFromDbAndEnv();
   runtimeState.configured = Boolean(resolved.token);
   runtimeState.tokenSource = resolved.tokenSource;

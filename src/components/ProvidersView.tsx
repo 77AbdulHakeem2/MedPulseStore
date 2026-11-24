@@ -32,6 +32,7 @@ import {
   SurfacePanel,
 } from './ui/AdminPrimitives';
 import type { AvailableProviderProduct, CategoryItem } from './ProductsPricingView';
+import SupplierProductBrowser from './SupplierProductBrowser';
 
 export interface ProviderItem {
   id: number;
@@ -114,6 +115,7 @@ export default function ProvidersView({
   const [serverSearch, setServerSearch] = useState('');
   const [serverStatusFilter, setServerStatusFilter] = useState<ServerGridStatusFilter>('all');
   const [inspectServerId, setInspectServerId] = useState<number | null>(null);
+  const [browseServerId, setBrowseServerId] = useState<number | null>(null);
 
   useEffect(() => {
     if (providers.length === 0) {
@@ -154,6 +156,11 @@ export default function ProvidersView({
   const inspectedServer = useMemo(
     () => providers.find((p) => p.id === inspectServerId) || null,
     [providers, inspectServerId]
+  );
+
+  const browsedServer = useMemo(
+    () => providers.find((p) => p.id === browseServerId) || null,
+    [providers, browseServerId]
   );
 
   const selectedServer = useMemo(
@@ -652,8 +659,20 @@ export default function ProvidersView({
                       )}
                     </button>
 
-                    {/* Bottom: Compact 2-Row Action Dock (ALL 7 original controls preserved!) */}
+                    {/* Bottom: Compact Action Dock (ALL original controls + Live Product Browser) */}
                     <div className="space-y-1.5 pt-1 border-t border-slate-100">
+                      <button
+                        type="button"
+                        data-testid={`browse-server-btn-${p.code}`}
+                        onClick={() => setBrowseServerId(p.id)}
+                        title={`تصفح منتجات ${p.name} مباشرة من API`}
+                        aria-label={`تصفح منتجات ${p.name}`}
+                        className="w-full inline-flex items-center justify-center gap-1.5 rounded-lg border border-emerald-700/25 bg-emerald-50/70 px-2 py-1.5 text-[11px] font-bold text-emerald-900 hover:bg-emerald-100/80 transition-colors whitespace-nowrap"
+                      >
+                        <PackageSearch className="h-3.5 w-3.5 shrink-0 text-emerald-700" />
+                        <span>تصفح المنتجات</span>
+                      </button>
+
                       <div className="grid grid-cols-2 gap-1">
                         <button
                           type="button"
@@ -669,11 +688,11 @@ export default function ProvidersView({
                         <button
                           type="button"
                           onClick={() => openOffersForServer(p)}
-                          title={`تصفح عروض ${p.name}`}
-                          aria-label={`تصفح عروض ${p.name}`}
+                          title={`العروض المسحوبة من ${p.name}`}
+                          aria-label={`العروض المسحوبة من ${p.name}`}
                           className="inline-flex items-center justify-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-[11px] font-semibold text-slate-700 hover:bg-slate-50 transition-colors whitespace-nowrap min-w-0"
                         >
-                          <PackageSearch className="h-3 w-3 shrink-0 text-emerald-700" />
+                          <PackageSearch className="h-3 w-3 shrink-0 text-slate-500" />
                           <span className="font-mono-num truncate">{p.productsCount}</span>
                         </button>
                       </div>
@@ -783,15 +802,25 @@ export default function ProvidersView({
               </div>
 
               {selectedServer && (
-                <button
-                  type="button"
-                  disabled={busyId === selectedServer.id}
-                  onClick={() => void handleSync(selectedServer)}
-                  className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-800 disabled:opacity-50 whitespace-nowrap shrink-0 self-start"
-                >
-                  <RefreshCw className={`h-3.5 w-3.5 ${busyId === selectedServer.id ? 'animate-spin' : ''}`} />
-                  تحديث {selectedServer.name}
-                </button>
+                <div className="flex flex-wrap items-center gap-2 shrink-0 self-start">
+                  <button
+                    type="button"
+                    onClick={() => setBrowseServerId(selectedServer.id)}
+                    className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-700/30 bg-emerald-50 px-3 py-1.5 text-xs font-bold text-emerald-900 hover:bg-emerald-100 whitespace-nowrap"
+                  >
+                    <PackageSearch className="h-3.5 w-3.5 text-emerald-700" />
+                    تصفح المنتجات (مباشر)
+                  </button>
+                  <button
+                    type="button"
+                    disabled={busyId === selectedServer.id}
+                    onClick={() => void handleSync(selectedServer)}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-800 disabled:opacity-50 whitespace-nowrap"
+                  >
+                    <RefreshCw className={`h-3.5 w-3.5 ${busyId === selectedServer.id ? 'animate-spin' : ''}`} />
+                    تحديث {selectedServer.name}
+                  </button>
+                </div>
               )}
             </div>
 
@@ -1108,6 +1137,17 @@ export default function ProvidersView({
                 <div className="flex flex-wrap items-center gap-1.5">
                   <button
                     type="button"
+                    onClick={() => {
+                      setInspectServerId(null);
+                      setBrowseServerId(p.id);
+                    }}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-slate-900 px-3 py-1.5 text-xs font-semibold text-white hover:bg-slate-800 whitespace-nowrap"
+                  >
+                    <PackageSearch className="h-3.5 w-3.5" />
+                    تصفح المنتجات
+                  </button>
+                  <button
+                    type="button"
                     disabled={isBusy}
                     onClick={() => void handleSync(p)}
                     className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-800 disabled:opacity-50 whitespace-nowrap"
@@ -1362,6 +1402,21 @@ export default function ProvidersView({
             </form>
           </div>
         </div>
+      )}
+
+      {/* Live Supplier Product Browser Modal */}
+      {browsedServer && (
+        <SupplierProductBrowser
+          provider={browsedServer}
+          storeCategories={categories}
+          onClose={() => setBrowseServerId(null)}
+          onImported={onRefresh}
+          onOpenApiKeyModal={(prov) => {
+            setKeyModalProv(prov);
+            setApiKeyInput('');
+            setWebhookSecretInput('');
+          }}
+        />
       )}
     </div>
   );

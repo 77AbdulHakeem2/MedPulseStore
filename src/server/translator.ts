@@ -251,11 +251,64 @@ async function translateViaTranslateApi(
   }
 }
 
+const TG_CUSTOM_EMOJI_ELEMENT_RE = /<tg-emoji\b[^>]*>[\s\S]*?<\/tg-emoji>/gi;
+const TG_MARKUP_TAG_RE = /<\/?[a-zA-Z][a-zA-Z0-9-]*(?:\s+(?:[^"'<>]|"[^"]*"|'[^']*')*)?\s*\/?>/g;
+
+/**
+ * Masks complete `<tg-emoji ...>...</tg-emoji>` elements and Telegram HTML tags into
+ * translation-safe opaque placeholders so external translators NEVER drop, split, or corrupt
+ * custom emoji IDs or HTML attributes.
+ */
+export function protectTelegramHtmlForTranslation(input: string): {
+  masked: string;
+  tokens: Map<string, string>;
+  hasProtectedTokens: boolean;
+} {
+  const tokens = new Map<string, string>();
+  if (!input) return { masked: '', tokens, hasProtectedTokens: false };
+
+  let ceIdx = 0;
+  let tagIdx = 0;
+
+  // 1. Protect full <tg-emoji ...>...</tg-emoji> atoms first
+  let masked = input.replace(TG_CUSTOM_EMOJI_ELEMENT_RE, (full) => {
+    const token = `[[TG_CE_${ceIdx++}]]`;
+    tokens.set(token, full);
+    return token;
+  });
+
+  // 2. Protect remaining HTML tags (<blockquote>, <b>, <a href="...">, <code>, etc.)
+  masked = masked.replace(TG_MARKUP_TAG_RE, (full) => {
+    const token = `[[TG_TAG_${tagIdx++}]]`;
+    tokens.set(token, full);
+    return token;
+  });
+
+  return { masked, tokens, hasProtectedTokens: tokens.size > 0 };
+}
+
+/**
+ * Restores masked placeholders back to exact original `<tg-emoji>` and Telegram HTML tags,
+ * tolerating minor whitespace introduced around brackets/underscores by machine translation.
+ */
+export function restoreProtectedTelegramHtml(
+  translated: string,
+  tokens: Map<string, string>
+): string {
+  if (!translated || tokens.size === 0) return translated || '';
+
+  return translated.replace(/\[\[\s*TG_(CE|TAG)_(\d+)\s*\]\]/gi, (full, kind: string, num: string) => {
+    const canonicalKey = `[[TG_${kind.toUpperCase()}_${num}]]`;
+    return tokens.get(canonicalKey) ?? full;
+  });
+}
+
 /**
  * Automatically detects the input language (AR or EN) and translates into the counterpart language.
  * - Uses server-side Gemini (`gemini-4-hydrogen` with `gemini-3.1-flash-lite` failover) when `GEMINI_API_KEY`
  *   is configured, with failover to Google Translate HTTPS API if Gemini is unavailable.
- * - Preserves original text verbatim in its source language and saves both AR & EN cleanly.
+ * - Masks `<tg-emoji>` and Telegram HTML tags via placeholders before translation and restores them cleanly
+ *   so custom emoji IDs and formatting always remain intact.
  */
 export async function autoTranslateBilingual(
   inputText: string,
@@ -278,6 +331,23 @@ export async function autoTranslateBilingual(
     context === 'product_title' ||
     context === 'warranty_label';
 
+  const protection = protectTelegramHtmlForTranslation(trimmed);
+  const payloadToTranslate = protection.hasProtectedTokens ? protection.masked : trimmed;
+
+  const finalizeResult = (rawRes: BilingualTranslationResult): BilingualTranslationResult => {
+    if (!protection.hasProtectedTokens) return rawRes;
+    const restoredCounterpart =
+      sourceLang === 'ar'
+        ? restoreProtectedTelegramHtml(rawRes.textEn, protection.tokens)
+        : restoreProtectedTelegramHtml(rawRes.textAr, protection.tokens);
+    return {
+      sourceLang,
+      textAr: sourceLang === 'ar' ? trimmed : restoredCounterpart,
+      textEn: sourceLang === 'en' ? trimmed : restoredCounterpart,
+      engine: rawRes.engine,
+    };
+  };
+
   const hasGeminiKey = Boolean((process.env.GEMINI_API_KEY || process.env.API_KEY || '').trim());
   if (hasGeminiKey) {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -285,11 +355,16 @@ export async function autoTranslateBilingual(
       const timeoutPromise = new Promise<never>((_, reject) => {
         timer = setTimeout(() => reject(new Error('GEMINI_TRANSLATE_TIMEOUT')), 10000);
       });
-      return await Promise.race([translateViaGemini(trimmed, sourceLang, context), timeoutPromise]);
+      const res = await Promise.race([
+        translateViaGemini(payloadToTranslate, sourceLang, context),
+        timeoutPromise,
+      ]);
+      return finalizeResult(res);
     } catch (geminiErr: any) {
       console.warn('Gemini translation fallback triggered:', geminiErr?.message || geminiErr);
       try {
-        return await translateViaTranslateApi(trimmed, sourceLang, isShortLabel);
+        const res = await translateViaTranslateApi(payloadToTranslate, sourceLang, isShortLabel);
+        return finalizeResult(res);
       } catch {
         throw new Error(
           'تعذر إتمام الترجمة التلقائية حاليًا. يرجى التحقق من مفتاح GEMINI_API_KEY في الإعدادات (Settings > Secrets) أو المحاولة لاحقًا.'
@@ -301,7 +376,8 @@ export async function autoTranslateBilingual(
   }
 
   try {
-    return await translateViaTranslateApi(trimmed, sourceLang, isShortLabel);
+    const res = await translateViaTranslateApi(payloadToTranslate, sourceLang, isShortLabel);
+    return finalizeResult(res);
   } catch {
     throw new Error(
       'خدمة الترجمة التلقائية تتطلب تفعيل مفتاح GEMINI_API_KEY في الإعدادات (Settings > Secrets)، أو يمكنك حفظ المنتج وسيتم حفظ النص مباشرة.'

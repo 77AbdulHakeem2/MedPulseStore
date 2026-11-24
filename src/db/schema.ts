@@ -200,6 +200,7 @@ export const productProviderMappings = pgTable(
   },
   (table) => [
     uniqueIndex('store_provider_mapping_unique').on(table.storeProductId, table.providerProductId),
+    uniqueIndex('provider_product_single_store_unique').on(table.providerProductId),
   ]
 );
 

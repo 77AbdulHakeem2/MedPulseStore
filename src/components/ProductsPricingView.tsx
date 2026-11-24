@@ -23,9 +23,18 @@ import {
   Languages,
   ChevronDown,
   ChevronUp,
+  ShieldAlert,
+  CheckCircle2,
+  RefreshCw,
 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
 import { classifyOfferBrand } from '../lib/offerClassifier';
+import {
+  filterUnlinkedAvailableOffers,
+  isOfferCompatibleWithStoreProduct,
+  type MappingAuditReport,
+} from '../lib/providerMappingHelpers';
+import TelegramHtmlRenderer from './TelegramHtmlRenderer';
 import {
   FeedbackBanner,
   KpiCard,
@@ -220,6 +229,11 @@ export default function ProductsPricingView({
 
   const [deleteTarget, setDeleteTarget] = useState<AdminProductItem | null>(null);
 
+  const [showAuditModal, setShowAuditModal] = useState(false);
+  const [auditReport, setAuditReport] = useState<(MappingAuditReport & { scannedAt?: string }) | null>(null);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditSelectedMappingIds, setAuditSelectedMappingIds] = useState<number[]>([]);
+
   const [editing, setEditing] = useState<AdminProductItem | null>(null);
   const [editManualBilingual, setEditManualBilingual] = useState(false);
   const [editTitlePreview, setEditTitlePreview] = useState<{ textAr: string; textEn: string } | null>(null);
@@ -326,6 +340,12 @@ export default function ProductsPricingView({
     }
   }, [selectedProduct?.id, selectedProduct?.retailPrice, selectedProduct?.agentPrice]);
 
+  // Strictly exclude ANY provider offer already linked to a store product so no offer can ever be linked twice
+  const unlinkedAvailableOffers = useMemo(
+    () => filterUnlinkedAvailableOffers(availableProviderProducts),
+    [availableProviderProducts]
+  );
+
   const smartCandidateOffers = useMemo(() => {
     if (!selectedProduct) return [];
     const linkedIds = new Set(selectedProduct.providerOffers.map((o) => o.providerProductId));
@@ -345,7 +365,7 @@ export default function ProductsPricingView({
       .split(/[\s\-—_/()[\]]+/)
       .filter((tok) => tok.length >= 3 && !stopTokens.has(tok));
 
-    const pool = availableProviderProducts.filter((ap) => !linkedIds.has(ap.id));
+    const pool = unlinkedAvailableOffers.filter((ap) => !linkedIds.has(ap.id));
 
     const scored = pool
       .map((ap) => {
@@ -380,7 +400,7 @@ export default function ProductsPricingView({
     });
 
     return scored;
-  }, [selectedProduct, availableProviderProducts, matcherOnlyRelevant, matcherServerId, matcherSearch]);
+  }, [selectedProduct, unlinkedAvailableOffers, matcherOnlyRelevant, matcherServerId, matcherSearch]);
 
   const createMatchingOffers = useMemo(() => {
     const selectedCat = categories.find((c) => String(c.id) === createForm.categoryId);
@@ -388,7 +408,7 @@ export default function ProductsPricingView({
     const targetBrand = classifyOfferBrand(seedText, '');
     const q = createOfferSearch.trim().toLowerCase();
 
-    return [...availableProviderProducts]
+    return [...unlinkedAvailableOffers]
       .filter((ap) => {
         if (q) return `${ap.rawName} ${ap.providerName}`.toLowerCase().includes(q);
         if (targetBrand.key !== 'other') {
@@ -406,7 +426,7 @@ export default function ProductsPricingView({
         return Number(a.wholesalePrice) - Number(b.wholesalePrice);
       })
       .slice(0, 40);
-  }, [availableProviderProducts, createForm.title, createForm.categoryId, categories, createOfferSearch, createSelectedOfferIds]);
+  }, [unlinkedAvailableOffers, createForm.title, createForm.categoryId, categories, createOfferSearch, createSelectedOfferIds]);
 
   const liveProfitPreview = useMemo(() => {
     if (!editing) return null;
@@ -747,6 +767,60 @@ export default function ProductsPricingView({
     }
   };
 
+  const loadProviderAudit = async (autoSelectIssues = false) => {
+    setAuditLoading(true);
+    try {
+      const res = await apiFetch<MappingAuditReport & { ok: boolean; scannedAt?: string }>(
+        '/api/admin/products/provider-audit'
+      );
+      setAuditReport(res);
+      if (autoSelectIssues) {
+        setAuditSelectedMappingIds(res.issues.map((i) => i.mappingId));
+      } else {
+        const validSet = new Set(res.issues.map((i) => i.mappingId));
+        setAuditSelectedMappingIds((prev) => prev.filter((id) => validSet.has(id)));
+      }
+    } catch (err: any) {
+      setFeedback({ type: 'err', text: err?.message || 'تعذر فحص ارتباطات المزودين.' });
+    } finally {
+      setAuditLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void loadProviderAudit(false);
+  }, [products.length]);
+
+  const openProviderAuditModal = async () => {
+    setShowAuditModal(true);
+    await loadProviderAudit(true);
+  };
+
+  const handleCleanupAuditMappings = async (mappingIds: number[]) => {
+    if (mappingIds.length === 0) return;
+    setBusy(true);
+    setFeedback(null);
+    try {
+      const res = await apiFetch<{ ok: boolean; removedCount: number; affectedProductsCount: number }>(
+        '/api/admin/products/provider-audit/cleanup',
+        {
+          method: 'POST',
+          body: JSON.stringify({ mappingIds }),
+        }
+      );
+      setFeedback({
+        type: 'ok',
+        text: `تم تنظيف وإزالة ${res.removedCount} ارتباط عبر ${res.affectedProductsCount} منتج وإعادة العروض لقائمة المتاح.`,
+      });
+      await onRefresh();
+      await loadProviderAudit(false);
+    } catch (err: any) {
+      setFeedback({ type: 'err', text: err?.message || 'تعذر تنظيف الارتباطات المحددة.' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const runSmartAutoCategorize = async (scope: 'uncategorized' | 'all', createMissingCategories: boolean) => {
     setBusy(true);
     setFeedback(null);
@@ -908,6 +982,24 @@ export default function ProductsPricingView({
                 + قسم
               </button>
             </form>
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void openProviderAuditModal()}
+              className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-semibold whitespace-nowrap transition-colors ${
+                (auditReport?.summary.flaggedCount || 0) > 0
+                  ? 'border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100'
+                  : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+              }`}
+            >
+              <ShieldAlert className={`h-3.5 w-3.5 ${(auditReport?.summary.flaggedCount || 0) > 0 ? 'text-amber-600' : 'text-slate-500'}`} />
+              <span>مراجعة وتنظيف الارتباطات</span>
+              {auditReport && auditReport.summary.flaggedCount > 0 && (
+                <span className="rounded bg-amber-600 px-1.5 py-0.5 font-mono-num text-[10px] font-bold text-white">
+                  {auditReport.summary.flaggedCount}
+                </span>
+              )}
+            </button>
             <button
               type="button"
               disabled={busy}
@@ -1336,17 +1428,17 @@ export default function ProductsPricingView({
                 </div>
               </SurfacePanel>
 
-              {/* Part B: Ordered Provider Priority Queue (1 -> 2 -> 3) */}
+              {/* Part B: Independent Provider Management, Compatibility Check & Priority Queue */}
               <SurfacePanel>
                 <SectionHeader
-                  title={`ترتيب أولوية المزودين (${selectedProduct.providerOffers.length})`}
+                  title={`إدارة وتحرير المزودين المرتبطين (${selectedProduct.providerOffers.length})`}
                   icon={Layers}
-                  action={<span className="font-mono-num text-[11px] text-slate-400">1 ← 2 ← 3</span>}
+                  action={<span className="font-mono-num text-[11px] text-slate-400">أولوية 1 ← 2 ← 3</span>}
                 />
 
                 {selectedProduct.providerOffers.length === 0 ? (
                   <div className="p-6 text-center text-xs text-slate-400">
-                    لا يوجد مزودون مرتبطون بعد — أضف مزودًا من القائمة بالأسفل.
+                    لا يوجد مزودون مرتبطون بهذا المنتج حاليًا — أضف مزودًا متاحًا من القائمة بالأسفل.
                   </div>
                 ) : (
                   <div className="divide-y divide-slate-100">
@@ -1354,6 +1446,13 @@ export default function ProductsPricingView({
                       const status = getRoutingStatus(offer.routingState);
                       const isFirst = idx === 0;
                       const isLast = idx === selectedProduct.providerOffers.length - 1;
+                      const compat = isOfferCompatibleWithStoreProduct({
+                        storeProductTitle: selectedProduct.titleAr,
+                        storeProductCategoryName: selectedProduct.categoryNameAr,
+                        storeProductDescription: selectedProduct.descriptionAr,
+                        providerOfferRawName: offer.rawName,
+                      });
+                      const providerDisabled = offer.providerEnabled === false || offer.providerStatus === 'disabled';
                       return (
                         <div
                           key={offer.mappingId}
@@ -1373,13 +1472,24 @@ export default function ProductsPricingView({
                             </div>
 
                             <div className="min-w-0 flex-1 space-y-0.5">
-                              <div className="flex flex-wrap items-center gap-2.5">
+                              <div className="flex flex-wrap items-center gap-2">
                                 <span className="text-sm font-bold text-slate-900">{offer.providerName}</span>
                                 <SemanticStatus tone={status.tone} label={status.label} />
+                                {providerDisabled && (
+                                  <SemanticStatus tone="negative" label="خادم معطل" />
+                                )}
+                                {!compat.compatible && (
+                                  <SemanticStatus tone="warning" label="عدم تطابق الخدمة" />
+                                )}
                               </div>
                               <div className="text-xs text-slate-500 truncate" title={offer.rawName}>
                                 {offer.rawName}
                               </div>
+                              {!compat.compatible && (
+                                <div className="text-[11px] font-medium text-amber-800">
+                                  ⚠️ {compat.reasonAr}
+                                </div>
+                              )}
                               <div className="flex flex-wrap items-center gap-2.5 text-[11px] font-mono-num text-slate-500">
                                 <span>جملة <strong className="text-slate-900">${offer.wholesalePrice}</strong></span>
                                 <span>·</span>
@@ -1433,6 +1543,7 @@ export default function ProductsPricingView({
                               type="button"
                               disabled={busy}
                               onClick={() => void toggleProviderActive(offer)}
+                              aria-label={offer.isActive ? `إيقاف ${offer.providerName} مؤقتًا` : `تفعيل ${offer.providerName}`}
                               title={offer.isActive ? 'إيقاف مؤقت' : 'تفعيل'}
                               className="rounded-lg border border-slate-200 bg-white p-1.5 text-slate-500 hover:text-amber-700"
                             >
@@ -1441,11 +1552,13 @@ export default function ProductsPricingView({
                             <button
                               type="button"
                               disabled={busy}
-                              onClick={() => void handleUnlinkProvider(offer.mappingId, offer.providerName)}
-                              title="فك الارتباط"
-                              className="rounded-lg border border-rose-200 bg-white p-1.5 text-rose-600 hover:bg-rose-50"
+                              onClick={() => void handleUnlinkProvider(offer.mappingId, `${offer.providerName} — ${offer.rawName}`)}
+                              aria-label={`حذف المزود ${offer.providerName} (${offer.rawName}) من ${selectedProduct.titleAr}`}
+                              title="حذف المزود وفك ارتباطه نهائيًا بهذا المنتج"
+                              className="inline-flex items-center gap-1 rounded-lg border border-rose-200 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-rose-600 hover:bg-rose-50 disabled:opacity-50"
                             >
                               <Unlink className="h-3.5 w-3.5" />
+                              <span>حذف المزود</span>
                             </button>
                           </div>
                         </div>
@@ -1455,10 +1568,10 @@ export default function ProductsPricingView({
                 )}
               </SurfacePanel>
 
-              {/* Part C: All-Servers Offer Matcher */}
+              {/* Part C: Unlinked-Only Available Offers Matcher */}
               <SurfacePanel>
                 <SectionHeader
-                  title="ربط مزودين إضافيين"
+                  title="ربط مزودين متاحين (غير مرتبطين بمنتجات أخرى)"
                   icon={Sparkles}
                   action={
                     <div className="inline-flex items-center gap-0.5 rounded-lg bg-slate-100 p-0.5">
@@ -1478,7 +1591,7 @@ export default function ProductsPricingView({
                           !matcherOnlyRelevant ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-500'
                         }`}
                       >
-                        الكل ({availableProviderProducts.length})
+                        الكل المتاح ({unlinkedAvailableOffers.length})
                       </button>
                     </div>
                   }
@@ -1669,11 +1782,15 @@ export default function ProductsPricingView({
                   <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 rounded-xl bg-emerald-50/70 border border-emerald-200/80 p-2.5 text-xs">
                     <div>
                       <span className="text-[10px] font-bold text-emerald-800">العربية (AR)</span>
-                      <div className="mt-0.5 whitespace-pre-line text-slate-800">{createDescPreview.textAr}</div>
+                      <div className="mt-0.5 text-slate-800">
+                        <TelegramHtmlRenderer html={createDescPreview.textAr} compact />
+                      </div>
                     </div>
                     <div dir="ltr" className="text-left">
                       <span className="text-[10px] font-bold text-emerald-800">English (EN)</span>
-                      <div className="mt-0.5 whitespace-pre-line text-slate-800">{createDescPreview.textEn}</div>
+                      <div className="mt-0.5 text-slate-800">
+                        <TelegramHtmlRenderer html={createDescPreview.textEn} compact />
+                      </div>
                     </div>
                   </div>
                 )}
@@ -1798,6 +1915,11 @@ export default function ProductsPricingView({
                       </button>
                     );
                   })}
+                  {createMatchingOffers.length === 0 && (
+                    <div className="p-4 text-center text-xs text-slate-400">
+                      لا توجد عروض غير مرتبطة مطابقة حاليًا (العروض المرتبطة بمنتجات أخرى مخفية لمنع التكرار).
+                    </div>
+                  )}
                 </div>
               </div>
 
@@ -1933,14 +2055,14 @@ export default function ProductsPricingView({
                       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 rounded-xl bg-slate-50 border border-slate-200/80 p-2.5 text-xs">
                         <div>
                           <span className="text-[10px] font-bold text-slate-500">العربية (AR)</span>
-                          <div className="mt-0.5 whitespace-pre-line text-slate-700 line-clamp-3">
-                            {editDescPreview.textAr || '—'}
+                          <div className="mt-0.5 text-slate-700 max-h-28 overflow-y-auto">
+                            {editDescPreview.textAr ? <TelegramHtmlRenderer html={editDescPreview.textAr} compact /> : '—'}
                           </div>
                         </div>
                         <div dir="ltr" className="text-left">
                           <span className="text-[10px] font-bold text-slate-500">English (EN)</span>
-                          <div className="mt-0.5 whitespace-pre-line text-slate-700 line-clamp-3">
-                            {editDescPreview.textEn || '—'}
+                          <div className="mt-0.5 text-slate-700 max-h-28 overflow-y-auto">
+                            {editDescPreview.textEn ? <TelegramHtmlRenderer html={editDescPreview.textEn} compact /> : '—'}
                           </div>
                         </div>
                       </div>
@@ -2319,6 +2441,181 @@ export default function ProductsPricingView({
                 <Wand2 className="h-3.5 w-3.5" />
                 {busy ? 'جارٍ التنفيذ...' : 'تنفيذ'}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* PROVIDER LINKS AUDIT & MANUAL CLEANUP MODAL */}
+      {showAuditModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 overflow-y-auto">
+          <div className="w-full max-w-3xl rounded-2xl bg-white border border-slate-200 p-6 my-8 space-y-4 max-h-[90vh] flex flex-col shadow-xl">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3 shrink-0">
+              <div className="flex items-center gap-2">
+                <ShieldAlert className="h-5 w-5 text-amber-600 shrink-0" />
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">مراجعة وتنظيف ارتباطات المزودين</h3>
+                  <p className="text-xs text-slate-500">
+                    فحص شامل لجميع المنتجات للتأكد من منع التكرار وإزالة أي مزود معطل أو غير مطابق لخدمة المنتج
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  disabled={auditLoading || busy}
+                  onClick={() => void loadProviderAudit(true)}
+                  className="inline-flex items-center gap-1 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                >
+                  <RefreshCw className={`h-3.5 w-3.5 ${auditLoading ? 'animate-spin' : ''}`} />
+                  إعادة الفحص
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setShowAuditModal(false)}
+                  className="text-xs font-semibold text-slate-500 hover:text-slate-900 px-2 py-1"
+                >
+                  إغلاق
+                </button>
+              </div>
+            </div>
+
+            {auditReport && (
+              <div className="grid grid-cols-3 gap-2.5 text-center shrink-0">
+                <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2">
+                  <div className="text-[11px] text-slate-500">إجمالي الارتباطات</div>
+                  <div className="font-mono-num text-base font-bold text-slate-900">{auditReport.summary.totalMappings}</div>
+                </div>
+                <div className="rounded-xl border border-emerald-200 bg-emerald-50/60 px-3 py-2">
+                  <div className="text-[11px] text-emerald-800">ارتباطات سليمة ومطابقة</div>
+                  <div className="font-mono-num text-base font-bold text-emerald-700">{auditReport.summary.healthyCount}</div>
+                </div>
+                <div className={`rounded-xl border px-3 py-2 ${auditReport.summary.flaggedCount > 0 ? 'border-amber-300 bg-amber-50' : 'border-emerald-200 bg-emerald-50/40'}`}>
+                  <div className="text-[11px] text-slate-600">تحتاج مراجعة / تنظيف</div>
+                  <div className={`font-mono-num text-base font-bold ${auditReport.summary.flaggedCount > 0 ? 'text-amber-700' : 'text-emerald-700'}`}>
+                    {auditReport.summary.flaggedCount}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div className="flex-1 overflow-y-auto divide-y divide-slate-100 rounded-xl border border-slate-200 min-h-[160px]">
+              {auditLoading && !auditReport ? (
+                <div className="p-8 text-center text-xs text-slate-500">جارٍ فحص جميع ارتباطات المزودين...</div>
+              ) : auditReport && auditReport.issues.length === 0 ? (
+                <div className="p-8 text-center space-y-2">
+                  <CheckCircle2 className="h-8 w-8 text-emerald-600 mx-auto" />
+                  <div className="text-sm font-bold text-slate-900">جميع الارتباطات الحالية سليمة 100%</div>
+                  <div className="text-xs text-slate-500">
+                    لا توجد عروض مكررة ولا خوادم معطلة ولا مزودون غير متطابقين مع خدمات المنتجات.
+                  </div>
+                </div>
+              ) : (
+                auditReport?.issues.map((issue) => {
+                  const checked = auditSelectedMappingIds.includes(issue.mappingId);
+                  return (
+                    <div
+                      key={issue.mappingId}
+                      className={`p-3.5 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between ${
+                        checked ? 'bg-amber-50/40' : 'bg-white'
+                      }`}
+                    >
+                      <div className="flex items-start gap-3 min-w-0">
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          aria-label={`تحديد ارتباط ${issue.providerName} بالمنتج ${issue.storeProductTitle}`}
+                          onChange={(e) => {
+                            setAuditSelectedMappingIds((prev) =>
+                              e.target.checked
+                                ? [...prev, issue.mappingId]
+                                : prev.filter((id) => id !== issue.mappingId)
+                            );
+                          }}
+                          className="mt-1 accent-amber-600"
+                        />
+                        <div className="min-w-0 space-y-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="text-xs font-bold text-slate-900">{issue.storeProductTitle}</span>
+                            <SemanticStatus
+                              tone={issue.severity === 'high' ? 'negative' : 'warning'}
+                              label={
+                                issue.primaryIssue === 'duplicate_offer_across_products'
+                                  ? 'ارتباط مكرر'
+                                  : issue.primaryIssue === 'service_mismatch'
+                                    ? 'عدم تطابق الخدمة'
+                                    : issue.primaryIssue === 'disabled_provider'
+                                      ? 'خادم معطل'
+                                      : 'عرض متوقف'
+                              }
+                            />
+                            <span className="text-[11px] text-slate-400">
+                              ({issue.storeProductVisible ? 'ظاهر' : 'مخفي'})
+                            </span>
+                          </div>
+                          <div className="text-xs text-slate-700">
+                            <strong className="text-slate-900">{issue.providerName}</strong> — {issue.providerOfferRawName}
+                          </div>
+                          <div className="text-[11px] text-amber-800">{issue.reasonAr}</div>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={busy}
+                        onClick={() => void handleCleanupAuditMappings([issue.mappingId])}
+                        aria-label={`إزالة ارتباط ${issue.providerName} من ${issue.storeProductTitle}`}
+                        className="inline-flex items-center gap-1 rounded-lg border border-rose-200 bg-white px-2.5 py-1.5 text-[11px] font-semibold text-rose-600 hover:bg-rose-50 shrink-0 self-end sm:self-center disabled:opacity-50"
+                      >
+                        <Unlink className="h-3.5 w-3.5" />
+                        إزالة الارتباط
+                      </button>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3 shrink-0">
+              <div className="flex items-center gap-2">
+                {auditReport && auditReport.issues.length > 0 && (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => setAuditSelectedMappingIds(auditReport.issues.map((i) => i.mappingId))}
+                      className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                    >
+                      تحديد الكل ({auditReport.issues.length})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAuditSelectedMappingIds([])}
+                      className="rounded-lg border border-slate-200 px-3 py-1.5 text-xs font-semibold text-slate-600 hover:bg-slate-50"
+                    >
+                      إلغاء التحديد
+                    </button>
+                  </>
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowAuditModal(false)}
+                  className="rounded-lg border border-slate-200 px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-50"
+                >
+                  إغلاق
+                </button>
+                {auditReport && auditReport.issues.length > 0 && (
+                  <button
+                    type="button"
+                    disabled={busy || auditSelectedMappingIds.length === 0}
+                    onClick={() => void handleCleanupAuditMappings(auditSelectedMappingIds)}
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-rose-600 px-4 py-2 text-xs font-semibold text-white hover:bg-rose-700 disabled:opacity-50"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                    تنظيف المحدد ({auditSelectedMappingIds.length})
+                  </button>
+                )}
+              </div>
             </div>
           </div>
         </div>

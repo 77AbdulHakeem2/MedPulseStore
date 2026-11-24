@@ -1,6 +1,13 @@
 import Decimal from 'decimal.js';
 import { verifyHmacSha256 } from '../crypto.ts';
 import { extractSupplierRawDescription } from '../productDescriptionEngine.ts';
+import {
+  extractPaginationDirective,
+  extractRawCatalogItemsList,
+  normalizeRichSupplierCatalog,
+  normalizeRichSupplierItem,
+  type SupplierVariantSummary,
+} from '../supplierCatalogBrowser.ts';
 
 export interface NormalizedProviderProduct {
   externalProductId: string;
@@ -16,6 +23,16 @@ export interface NormalizedProviderProduct {
   durationLabel: string;
   warrantyDays: number;
   pricingTiers?: Array<{ minQty: number; maxQty: number | null; price: string }>;
+  imageUrl?: string;
+  suggestedRetailPrice?: string | null;
+  categoryName?: string;
+  productType?: string;
+  warrantyLabel?: string;
+  deliveryInstructions?: string;
+  features?: string[];
+  variantsSummary?: SupplierVariantSummary[];
+  isAvailable?: boolean;
+  extraMetadata?: Record<string, string | number | boolean>;
 }
 
 export interface NormalizedBalanceResult {
@@ -177,23 +194,28 @@ export const pixoraAdapter: ProviderAdapter = {
     if (!res.ok || !res.data) {
       throw new Error(`Pixora catalog error: HTTP ${res.status}`);
     }
-    const items = Array.isArray(res.data) ? res.data : [res.data];
-    return items
-      .filter((p: any) => p && (p.service_key || p.id))
-      .map((p: any) => ({
-        externalProductId: String(p.service_key || p.id),
-        externalVariantId: '',
-        rawName: String(p.name || p.service_key),
-        rawDescription: extractSupplierRawDescription(p) || 'Instant activation link delivery',
-        wholesalePrice: new Decimal(p.price ?? 0).toFixed(4),
-        currency: String(p.currency || 'USD'),
-        stockCount: Number(p.stock ?? 0),
-        minQty: 1,
-        maxQty: 20,
-        deliveryType: 'link',
-        durationLabel: /24m/i.test(String(p.name || p.service_key)) ? '24 شهر' : '18 شهر',
-        warrantyDays: 540,
-      }));
+    const items = Array.isArray(res.data) ? res.data : extractRawCatalogItemsList(res.data);
+    const list = items.length > 0 ? items : [res.data];
+    return list
+      .filter((p: any) => p && (p.service_key || p.id || p.product_id))
+      .map((p: any) => {
+        const rich = normalizeRichSupplierItem(p, String(p.currency || 'USD'))[0];
+        return {
+          ...(rich || {}),
+          externalProductId: String(p.service_key || p.id || rich?.externalProductId || ''),
+          externalVariantId: rich?.externalVariantId || '',
+          rawName: String(p.name || p.service_key || rich?.rawName || 'Product'),
+          rawDescription: extractSupplierRawDescription(p) || rich?.rawDescription || 'Instant activation link delivery',
+          wholesalePrice: new Decimal(p.price ?? rich?.wholesalePrice ?? 0).toFixed(4),
+          currency: String(p.currency || 'USD'),
+          stockCount: Number(p.stock ?? rich?.stockCount ?? 0),
+          minQty: rich?.minQty || 1,
+          maxQty: rich?.maxQty || 20,
+          deliveryType: 'link',
+          durationLabel: rich?.durationLabel || (/24m/i.test(String(p.name || p.service_key)) ? '24 شهر' : '18 شهر'),
+          warrantyDays: rich?.warrantyDays ?? 540,
+        };
+      });
   },
 
   async getQuote() {
@@ -291,32 +313,76 @@ export const pandoraAdapter: ProviderAdapter = {
   },
 
   async fetchProducts(apiKey: string): Promise<NormalizedProviderProduct[]> {
-    const res = await safeFetchJson('pandora', `${this.baseUrl}/products?limit=50`, {
-      method: 'GET',
-      headers: { Authorization: `Bearer ${apiKey}` },
-    });
-    if (!res.ok || !res.data) {
-      throw new Error(`Pandora catalog error: HTTP ${res.status}`);
+    const headers = { Authorization: `Bearer ${apiKey}` };
+    const allItems: NormalizedProviderProduct[] = [];
+    const seenKeys = new Set<string>();
+    const origin = new URL(this.baseUrl).origin;
+    let page = 1;
+    let nextDirectUrl: string | null = `${this.baseUrl}/products?limit=100&page=1`;
+
+    for (let hop = 0; hop < 15 && nextDirectUrl; hop++) {
+      const res = await safeFetchJson('pandora', nextDirectUrl, { method: 'GET', headers }, 15_000, 60);
+      if (!res.ok || !res.data) {
+        if (hop === 0) throw new Error(`Pandora catalog error: HTTP ${res.status}`);
+        break;
+      }
+      const rawList = Array.isArray(res.data) ? res.data : res.data.items || res.data.products || res.data.data || [];
+      if (!Array.isArray(rawList) || rawList.length === 0) break;
+
+      let addedThisPage = 0;
+      for (const p of rawList) {
+        const richList = normalizeRichSupplierItem(p, String(p.currency || 'USD'));
+        for (const rich of richList) {
+          const extId = String(p.id ?? rich.externalProductId);
+          const varId = p.variant_id ? String(p.variant_id) : rich.externalVariantId || '';
+          const dedupKey = `${extId}::${varId}`;
+          if (seenKeys.has(dedupKey)) continue;
+          seenKeys.add(dedupKey);
+          addedThisPage += 1;
+          allItems.push({
+            ...rich,
+            externalProductId: extId,
+            externalVariantId: varId,
+            rawName: p.variant_name ? `${p.name} — ${p.variant_name}` : String(p.name || rich.rawName),
+            rawDescription: extractSupplierRawDescription(p) || rich.rawDescription,
+            wholesalePrice: new Decimal(p.unit_price ?? rich.wholesalePrice ?? 0).toFixed(4),
+            currency: String(p.currency || rich.currency || 'USD'),
+            stockCount: Number(p.available_stock ?? rich.stockCount ?? 0),
+            minQty: Number(p.minimum_quantity ?? rich.minQty ?? 1),
+            maxQty: Number(p.maximum_quantity ?? rich.maxQty ?? 100),
+            deliveryType: String(p.delivery_type || rich.deliveryType || 'code').includes('account')
+              ? 'account'
+              : String(p.delivery_type || rich.deliveryType || 'code').includes('link')
+                ? 'link'
+                : 'code',
+          });
+        }
+      }
+
+      if (addedThisPage === 0) break;
+      const directive = extractPaginationDirective(res.data, page, (page - 1) * 100, 100, rawList.length, origin);
+      if (directive.kind === 'url') {
+        nextDirectUrl = directive.nextUrl;
+        page += 1;
+      } else if (directive.kind === 'cursor') {
+        nextDirectUrl = `${this.baseUrl}/products?limit=100&cursor=${encodeURIComponent(directive.cursor)}`;
+        page += 1;
+      } else if (directive.kind === 'page') {
+        page = directive.nextPage;
+        nextDirectUrl = `${this.baseUrl}/products?limit=100&page=${page}`;
+      } else if (directive.kind === 'offset') {
+        nextDirectUrl = `${this.baseUrl}/products?limit=${directive.limit}&offset=${directive.nextOffset}`;
+        page += 1;
+      } else if (rawList.length >= 100 && Array.isArray(res.data?.items || res.data?.products)) {
+        // Fallback page probe when total count omitted on a full 100-item page
+        page += 1;
+        nextDirectUrl = `${this.baseUrl}/products?limit=100&page=${page}`;
+      } else {
+        nextDirectUrl = null;
+      }
     }
-    const list = Array.isArray(res.data) ? res.data : res.data.items || res.data.products || [];
-    return list.map((p: any) => ({
-      externalProductId: String(p.id),
-      externalVariantId: p.variant_id ? String(p.variant_id) : '',
-      rawName: p.variant_name ? `${p.name} — ${p.variant_name}` : String(p.name),
-      rawDescription: extractSupplierRawDescription(p),
-      wholesalePrice: new Decimal(p.unit_price ?? 0).toFixed(4),
-      currency: String(p.currency || 'USD'),
-      stockCount: Number(p.available_stock ?? 0),
-      minQty: Number(p.minimum_quantity ?? 1),
-      maxQty: Number(p.maximum_quantity ?? 100),
-      deliveryType: String(p.delivery_type || 'code').includes('account')
-        ? 'account'
-        : String(p.delivery_type || 'code').includes('link')
-          ? 'link'
-          : 'code',
-      durationLabel: '',
-      warrantyDays: 30,
-    }));
+
+    return allItems;
   },
 
   async getQuote(apiKey: string, params): Promise<NormalizedQuoteResult | null> {
@@ -445,20 +511,19 @@ export const qorixAdapter: ProviderAdapter = {
       throw new Error(`QORIX catalog error: HTTP ${res.status}`);
     }
     const list = Array.isArray(res.data) ? res.data : res.data.products || res.data.data || [];
-    return list.map((p: any) => ({
-      externalProductId: String(p.id || p.product_id),
-      externalVariantId: '',
-      rawName: String(p.name || p.title),
-      rawDescription: extractSupplierRawDescription(p),
-      wholesalePrice: new Decimal(p.reseller_price ?? p.price ?? 0).toFixed(4),
-      currency: String(p.currency || 'USD'),
-      stockCount: Number(p.stock ?? (p.in_stock ? 25 : 0)),
-      minQty: 1,
-      maxQty: 50,
-      deliveryType: 'account',
-      durationLabel: String(p.duration || ''),
-      warrantyDays: Number(p.warranty_days ?? 30),
-    }));
+    return list.flatMap((p: any) => {
+      const richList = normalizeRichSupplierItem(p, String(p.currency || 'USD'));
+      return richList.map((rich) => ({
+        ...rich,
+        externalProductId: String(p.id || p.product_id || rich.externalProductId),
+        rawName: String(p.name || p.title || rich.rawName),
+        rawDescription: extractSupplierRawDescription(p) || rich.rawDescription,
+        wholesalePrice: new Decimal(p.reseller_price ?? p.price ?? rich.wholesalePrice ?? 0).toFixed(4),
+        currency: String(p.currency || rich.currency || 'USD'),
+        stockCount: Number(p.stock ?? (p.in_stock ? 25 : rich.stockCount ?? 0)),
+        deliveryType: rich.deliveryType || 'account',
+      }));
+    });
   },
 
   async getQuote() {
@@ -563,27 +628,19 @@ export const digitalCoreAdapter: ProviderAdapter = {
     if (!res.ok || !Array.isArray(res.data)) {
       throw new Error(`DigitalCore catalog error: HTTP ${res.status}`);
     }
-    return res.data.map((p: any) => ({
-      externalProductId: String(p.id),
-      externalVariantId: '',
-      rawName: String(p.name),
-      rawDescription: extractSupplierRawDescription(p),
-      wholesalePrice: new Decimal(p.price ?? 0).toFixed(4),
-      currency: 'USD',
-      stockCount: Number(p.stock ?? 0),
-      minQty: 1,
-      maxQty: 1000,
-      deliveryType: 'link',
-      durationLabel: '',
-      warrantyDays: 30,
-      pricingTiers: Array.isArray(p.tiers)
-        ? p.tiers.map((t: any) => ({
-            minQty: Number(t.minQty ?? 1),
-            maxQty: t.maxQty === null ? null : Number(t.maxQty),
-            price: new Decimal(t.price ?? 0).toFixed(4),
-          }))
-        : undefined,
-    }));
+    return res.data.flatMap((p: any) => {
+      const richList = normalizeRichSupplierItem(p, 'USD');
+      return richList.map((rich) => ({
+        ...rich,
+        externalProductId: String(p.id ?? rich.externalProductId),
+        rawName: String(p.name || rich.rawName),
+        rawDescription: extractSupplierRawDescription(p) || rich.rawDescription,
+        wholesalePrice: new Decimal(p.price ?? rich.wholesalePrice ?? 0).toFixed(4),
+        currency: 'USD',
+        stockCount: Number(p.stock ?? rich.stockCount ?? 0),
+        deliveryType: 'link',
+      }));
+    });
   },
 
   async getQuote() {
@@ -691,32 +748,21 @@ export const aiVaultHubAdapter: ProviderAdapter = {
     if (!res.ok || !res.data) {
       throw new Error(`AIVault Hub catalog error: HTTP ${res.status}`);
     }
-    const list = Array.isArray(res.data.products) ? res.data.products : [];
-    return list.map((p: any) => {
+    const list = Array.isArray(res.data.products) ? res.data.products : extractRawCatalogItemsList(res.data);
+    return list.flatMap((p: any) => {
+      const richList = normalizeRichSupplierItem(p, 'USD');
       const firstTierPrice = Array.isArray(p.pricing_tiers) && p.pricing_tiers[0]?.price
         ? p.pricing_tiers[0].price
-        : p.price ?? 0;
-      return {
-        externalProductId: String(p.service_id),
-        externalVariantId: '',
-        rawName: String(p.name),
-        rawDescription: extractSupplierRawDescription(p),
+        : p.price ?? richList[0]?.wholesalePrice ?? 0;
+      return richList.map((rich) => ({
+        ...rich,
+        externalProductId: String(p.service_id ?? rich.externalProductId),
+        rawName: String(p.name ?? rich.rawName),
+        rawDescription: extractSupplierRawDescription(p) || rich.rawDescription,
         wholesalePrice: new Decimal(firstTierPrice).toFixed(4),
         currency: 'USD',
-        stockCount: Number(p.stock ?? 0),
-        minQty: 1,
-        maxQty: 1000,
-        deliveryType: 'code',
-        durationLabel: '',
-        warrantyDays: 30,
-        pricingTiers: Array.isArray(p.pricing_tiers)
-          ? p.pricing_tiers.map((t: any) => ({
-              minQty: Number(t.min ?? 1),
-              maxQty: t.max ? Number(t.max) : null,
-              price: new Decimal(t.price ?? 0).toFixed(4),
-            }))
-          : undefined,
-      };
+        stockCount: Number(p.stock ?? rich.stockCount ?? 0),
+      }));
     });
   },
 
@@ -932,115 +978,7 @@ function extractBalancePayload(data: any): { balance: string; currency: string; 
 }
 
 function normalizeGenericCatalogItems(rawData: any): NormalizedProviderProduct[] {
-  let list: any[] = [];
-  if (Array.isArray(rawData)) {
-    list = rawData;
-  } else if (rawData && typeof rawData === 'object') {
-    const candidate =
-      rawData.services ||
-      rawData.products ||
-      rawData.items ||
-      rawData.catalog ||
-      rawData.data?.services ||
-      rawData.data?.products ||
-      rawData.data?.items ||
-      (Array.isArray(rawData.data) ? rawData.data : null);
-    if (Array.isArray(candidate)) list = candidate;
-  }
-
-  const results: NormalizedProviderProduct[] = [];
-  for (const p of list) {
-    if (!p || typeof p !== 'object') continue;
-    const baseId = String(
-      p.service_id ?? p.product_id ?? p.productId ?? p.id ?? p._id ?? p.code ?? p.slug ?? ''
-    ).trim();
-    const rawName = String(
-      p.name ?? p.title ?? p.product_name ?? p.service_name ?? p.label ?? baseId ?? 'Product'
-    ).trim();
-    if (!baseId && !rawName) continue;
-
-    // Expand nested variants if present
-    if (Array.isArray(p.variants) && p.variants.length > 0) {
-      for (const v of p.variants) {
-        const varId = String(v.id ?? v.variant_id ?? v.code ?? v.name ?? '').trim();
-        const priceVal =
-          v.price_usdt ??
-          v.usdt_price ??
-          v.unit_price ??
-          v.price ??
-          v.cost ??
-          p.price_usdt ??
-          p.unit_price ??
-          p.price ??
-          0;
-        results.push({
-          externalProductId: baseId || rawName,
-          externalVariantId: varId,
-          rawName: v.name ? `${rawName} — ${v.name}` : rawName,
-          rawDescription: extractSupplierRawDescription(v, p),
-          wholesalePrice: safeDecimalString(priceVal),
-          currency: String(v.currency ?? p.currency ?? 'USD'),
-          stockCount: Number(v.stock ?? v.stock_count ?? v.available ?? p.stock ?? 0),
-          minQty: Number(v.min_qty ?? p.min_qty ?? 1),
-          maxQty: Number(v.max_qty ?? p.max_qty ?? 1000),
-          deliveryType: inferDeliveryType(String(v.delivery_type ?? p.delivery_type ?? rawName)),
-          durationLabel: String(v.duration ?? p.duration ?? p.period ?? ''),
-          warrantyDays: Number(v.warranty_days ?? p.warranty_days ?? 30),
-        });
-      }
-      continue;
-    }
-
-    const firstTierPrice =
-      Array.isArray(p.pricing_tiers) && p.pricing_tiers.length > 0
-        ? p.pricing_tiers[0]?.price
-        : undefined;
-    const priceVal =
-      p.price_usdt ??
-      p.usdt_price ??
-      p.unit_price ??
-      p.reseller_price ??
-      p.your_price ??
-      p.normal_price ??
-      firstTierPrice ??
-      p.price ??
-      p.cost ??
-      p.price_vnd ??
-      0;
-
-    const stockVal =
-      p.stock ??
-      p.stock_count ??
-      p.available ??
-      p.quantity ??
-      p.remaining ??
-      p.inventory ??
-      (p.inStock === true || p.in_stock === true ? 99 : 0);
-
-    results.push({
-      externalProductId: baseId || rawName,
-      externalVariantId: '',
-      rawName,
-      rawDescription: extractSupplierRawDescription(p),
-      wholesalePrice: safeDecimalString(priceVal),
-      currency: String(p.currency ?? (p.price_usdt !== undefined ? 'USDT' : 'USD')),
-      stockCount: Math.max(0, Number(stockVal) || 0),
-      minQty: Math.max(1, Number(p.min_qty ?? p.min_quantity ?? 1) || 1),
-      maxQty: Math.max(1, Number(p.max_qty ?? p.max_quantity ?? 1000) || 1000),
-      deliveryType: inferDeliveryType(String(p.delivery_type ?? p.type ?? rawName)),
-      durationLabel: String(p.duration ?? p.duration_label ?? p.period ?? ''),
-      warrantyDays: Math.max(0, Number(p.warranty_days ?? p.warranty ?? 30) || 0),
-      pricingTiers: Array.isArray(p.pricing_tiers)
-        ? p.pricing_tiers.map((t: any) => ({
-            minQty: Number(t.min ?? t.min_qty ?? 1),
-            maxQty: t.max || t.max_qty ? Number(t.max ?? t.max_qty) : null,
-            price: safeDecimalString(t.price ?? 0),
-          }))
-        : undefined,
-    });
-  }
-
-  return results;
+  return normalizeRichSupplierCatalog(rawData, 'USD');
 }
 
 function inferDeliveryType(hint: string): 'code' | 'link' | 'account' | 'manual' {
@@ -1157,21 +1095,103 @@ function createConfigurableResellerAdapter(spec: ConfigurableResellerSpec): Prov
         Accept: 'application/json',
       });
       let lastErr = 'FETCH_PRODUCTS_FAILED';
+      const baseOrigin = (() => {
+        try {
+          return new URL(cleanBase).origin;
+        } catch {
+          return cleanBase;
+        }
+      })();
 
       for (const path of spec.productsPaths) {
-        const url = `${cleanBase}${path.startsWith('/') ? path : `/${path}`}`;
-        const res = await safeFetchJson(spec.code, url, { method: 'GET', headers }, 15_000, limit);
-        if (res.ok && res.data) {
-          const items = normalizeGenericCatalogItems(res.data);
-          if (items.length > 0 || Array.isArray(res.data?.products) || Array.isArray(res.data?.services)) {
-            return items;
+        const firstUrl = `${cleanBase}${path.startsWith('/') ? path : `/${path}`}`;
+        const firstRes = await safeFetchJson(spec.code, firstUrl, { method: 'GET', headers }, 15_000, limit);
+        if (firstRes.ok && firstRes.data) {
+          const firstRawList = extractRawCatalogItemsList(firstRes.data);
+          const firstItems = normalizeGenericCatalogItems(firstRes.data);
+          const hasExplicitArray =
+            firstRawList.length > 0 ||
+            Array.isArray(firstRes.data) ||
+            Array.isArray(firstRes.data?.products) ||
+            Array.isArray(firstRes.data?.services) ||
+            Array.isArray(firstRes.data?.items) ||
+            Array.isArray(firstRes.data?.data);
+
+          if (hasExplicitArray) {
+            const collected: NormalizedProviderProduct[] = [];
+            const seen = new Set<string>();
+            const pushUnique = (batch: NormalizedProviderProduct[]): number => {
+              let added = 0;
+              for (const item of batch) {
+                const key = `${item.externalProductId}::${item.externalVariantId || ''}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                collected.push(item);
+                added += 1;
+              }
+              return added;
+            };
+            pushUnique(firstItems);
+
+            // Follow pagination cleanly across up to 12 pages without ever leaving baseOrigin
+            let currentData = firstRes.data;
+            let currentRawLen = firstRawList.length;
+            let currentPage = 1;
+            let currentOffset = 0;
+            const visitedUrls = new Set<string>([firstUrl]);
+
+            for (let hop = 0; hop < 11; hop++) {
+              const directive = extractPaginationDirective(
+                currentData,
+                currentPage,
+                currentOffset,
+                Math.max(1, currentRawLen),
+                currentRawLen,
+                baseOrigin
+              );
+              if (directive.kind === 'none') break;
+
+              let nextUrl = '';
+              const baseObj = new URL(firstUrl);
+              if (directive.kind === 'url') {
+                nextUrl = directive.nextUrl;
+              } else if (directive.kind === 'cursor') {
+                baseObj.searchParams.set('cursor', directive.cursor);
+                nextUrl = baseObj.toString();
+              } else if (directive.kind === 'page') {
+                currentPage = directive.nextPage;
+                baseObj.searchParams.set('page', String(currentPage));
+                if (directive.limit) baseObj.searchParams.set('limit', String(directive.limit));
+                nextUrl = baseObj.toString();
+              } else if (directive.kind === 'offset') {
+                currentOffset = directive.nextOffset;
+                baseObj.searchParams.set('offset', String(currentOffset));
+                baseObj.searchParams.set('limit', String(directive.limit));
+                nextUrl = baseObj.toString();
+              }
+
+              if (!nextUrl || visitedUrls.has(nextUrl)) break;
+              visitedUrls.add(nextUrl);
+
+              const nextRes = await safeFetchJson(spec.code, nextUrl, { method: 'GET', headers }, 15_000, limit);
+              if (!nextRes.ok || !nextRes.data) break;
+              const nextRawList = extractRawCatalogItemsList(nextRes.data);
+              const nextItems = normalizeGenericCatalogItems(nextRes.data);
+              if (nextItems.length === 0) break;
+              const added = pushUnique(nextItems);
+              if (added === 0) break;
+              currentData = nextRes.data;
+              currentRawLen = nextRawList.length;
+            }
+
+            return collected;
           }
         }
         lastErr =
-          (res.data && (res.data.message || res.data.error?.message || res.data.error)) ||
-          res.errorText ||
-          `HTTP_${res.status}`;
-        if (res.status === 401 || res.status === 403) {
+          (firstRes.data && (firstRes.data.message || firstRes.data.error?.message || firstRes.data.error)) ||
+          firstRes.errorText ||
+          `HTTP_${firstRes.status}`;
+        if (firstRes.status === 401 || firstRes.status === 403) {
           throw new Error(`${spec.name} auth error: ${String(lastErr)}`);
         }
       }
