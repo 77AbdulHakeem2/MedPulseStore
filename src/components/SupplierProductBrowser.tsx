@@ -81,6 +81,8 @@ interface BrowseCatalogResponse {
   };
   items: SupplierBrowserProductItem[];
   totalCatalogCount: number;
+  inStockCatalogCount?: number;
+  outOfStockCatalogCount?: number;
   importedCount: number;
   notImportedCount: number;
   totalMatched: number;
@@ -199,6 +201,8 @@ export default function SupplierProductBrowser({
 
   const [catalogMeta, setCatalogMeta] = useState<{
     totalCatalogCount: number;
+    inStockCatalogCount: number;
+    outOfStockCatalogCount: number;
     importedCount: number;
     notImportedCount: number;
     totalMatched: number;
@@ -210,6 +214,8 @@ export default function SupplierProductBrowser({
     fromCache: boolean;
   }>({
     totalCatalogCount: 0,
+    inStockCatalogCount: 0,
+    outOfStockCatalogCount: 0,
     importedCount: 0,
     notImportedCount: 0,
     totalMatched: 0,
@@ -229,6 +235,7 @@ export default function SupplierProductBrowser({
   const [debouncedSearch, setDebouncedSearch] = useState('');
   const [supplierCategoryFilter, setSupplierCategoryFilter] = useState('all');
   const [importStatusFilter, setImportStatusFilter] = useState<'all' | 'not_imported' | 'imported'>('all');
+  const [stockFilter, setStockFilter] = useState<'in_stock' | 'all' | 'out_of_stock'>('in_stock');
   const [page, setPage] = useState(1);
 
   // Selection & per-item overrides
@@ -267,6 +274,7 @@ export default function SupplierProductBrowser({
           page: String(page),
           pageSize: '24',
           status: importStatusFilter,
+          stock: stockFilter,
         });
         if (debouncedSearch) qs.set('search', debouncedSearch);
         if (supplierCategoryFilter && supplierCategoryFilter !== 'all') {
@@ -286,6 +294,8 @@ export default function SupplierProductBrowser({
         });
         setCatalogMeta({
           totalCatalogCount: res.totalCatalogCount,
+          inStockCatalogCount: res.inStockCatalogCount ?? res.totalCatalogCount,
+          outOfStockCatalogCount: res.outOfStockCatalogCount ?? 0,
           importedCount: res.importedCount,
           notImportedCount: res.notImportedCount,
           totalMatched: res.totalMatched,
@@ -305,7 +315,7 @@ export default function SupplierProductBrowser({
         setRefreshing(false);
       }
     },
-    [provider.id, page, debouncedSearch, supplierCategoryFilter, importStatusFilter]
+    [provider.id, page, debouncedSearch, supplierCategoryFilter, importStatusFilter, stockFilter]
   );
 
   useEffect(() => {
@@ -463,7 +473,11 @@ export default function SupplierProductBrowser({
             </div>
             <div className="mt-0.5 sm:mt-1 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] sm:text-xs text-slate-500">
               <span>
-                الإجمالي في الخادم:{' '}
+                بمخزون:{' '}
+                <strong className="font-mono-num tabular-nums text-emerald-700">
+                  {catalogMeta.inStockCatalogCount}
+                </strong>
+                {' '}من أصل{' '}
                 <strong className="font-mono-num tabular-nums text-slate-900">
                   {catalogMeta.totalCatalogCount}
                 </strong>
@@ -555,8 +569,21 @@ export default function SupplierProductBrowser({
               </select>
             </div>
 
-            {/* Filter by Import Status */}
-            <div className="col-span-1 lg:col-span-2">
+            {/* Filter by Stock & Import Status */}
+            <div className="col-span-1 lg:col-span-2 flex gap-1.5">
+              <select
+                aria-label="تصفية حسب توفر المخزون"
+                value={stockFilter}
+                onChange={(e) => {
+                  setStockFilter(e.target.value as 'in_stock' | 'all' | 'out_of_stock');
+                  setPage(1);
+                }}
+                className="flex-1 min-w-0 rounded-lg border border-emerald-200 bg-emerald-50/40 px-2 py-1.5 sm:py-2 text-xs font-semibold text-emerald-950 focus:border-slate-900 focus:outline-none"
+              >
+                <option value="in_stock">بمخزون فقط ({catalogMeta.inStockCatalogCount})</option>
+                <option value="out_of_stock">نفد ({catalogMeta.outOfStockCatalogCount})</option>
+                <option value="all">الكل</option>
+              </select>
               <select
                 aria-label="تصفية حسب حالة الاستيراد"
                 value={importStatusFilter}
@@ -564,7 +591,7 @@ export default function SupplierProductBrowser({
                   setImportStatusFilter(e.target.value as 'all' | 'not_imported' | 'imported');
                   setPage(1);
                 }}
-                className="w-full rounded-lg border border-slate-200 bg-white px-2 sm:px-3 py-1.5 sm:py-2 text-xs text-slate-800 focus:border-slate-900 focus:outline-none"
+                className="flex-1 min-w-0 rounded-lg border border-slate-200 bg-white px-2 py-1.5 sm:py-2 text-xs text-slate-800 focus:border-slate-900 focus:outline-none"
               >
                 <option value="all">الكل</option>
                 <option value="not_imported">غير مستورد فقط</option>
@@ -733,9 +760,11 @@ export default function SupplierProductBrowser({
               <FolderOpen className="mx-auto h-8 w-8 text-slate-400" />
               <div className="text-sm font-bold text-slate-800">لا توجد منتجات مطابقة في كتالوج الخادم</div>
               <p className="text-xs text-slate-500">
-                جرب تغيير كلمات البحث أو إعادة تعيين التصفية لعرض جميع المنتجات المتاحة.
+                {stockFilter === 'in_stock' && catalogMeta.outOfStockCatalogCount > 0
+                  ? `المنتجات المعروضة حاليًا هي المتوفرة بالمخزون فقط (يوجد ${catalogMeta.outOfStockCatalogCount} منتج نافد المخزون مخفي تلقائيًا).`
+                  : 'جرب تغيير كلمات البحث أو إعادة تعيين التصفية لعرض جميع المنتجات المتاحة.'}
               </p>
-              {(debouncedSearch || supplierCategoryFilter !== 'all' || importStatusFilter !== 'all') && (
+              {(debouncedSearch || supplierCategoryFilter !== 'all' || importStatusFilter !== 'all' || stockFilter !== 'all') && (
                 <button
                   type="button"
                   onClick={() => {
@@ -743,11 +772,12 @@ export default function SupplierProductBrowser({
                     setDebouncedSearch('');
                     setSupplierCategoryFilter('all');
                     setImportStatusFilter('all');
+                    setStockFilter('all');
                     setPage(1);
                   }}
                   className="inline-flex items-center rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50"
                 >
-                  إعادة تعيين الفلاتر
+                  عرض جميع المنتجات ({catalogMeta.totalCatalogCount})
                 </button>
               )}
             </div>

@@ -34,6 +34,13 @@ import {
   isOfferCompatibleWithStoreProduct,
   type MappingAuditReport,
 } from '../lib/providerMappingHelpers';
+import {
+  computeSwappedProductSortOrders,
+  filterAndSortAdminStoreProducts,
+  filterProviderOffersByStock,
+  isStoreProductInStock,
+  type StockVisibilityFilter,
+} from '../lib/stockVisibilityUtils';
 import TelegramHtmlRenderer from './TelegramHtmlRenderer';
 import {
   FeedbackBanner,
@@ -137,6 +144,7 @@ export interface AvailableProviderProduct {
   rawDescription?: string;
   wholesalePrice: string;
   stockCount: number;
+  isActiveAtProvider?: boolean;
   durationLabel: string | null;
   deliveryType: string;
   warrantyDays: number;
@@ -191,17 +199,20 @@ export default function ProductsPricingView({
   onRefresh,
 }: ProductsPricingViewProps) {
   const [search, setSearch] = useState('');
+  const [filterStock, setFilterStock] = useState<StockVisibilityFilter>('in_stock');
   const [filterVis, setFilterVis] = useState<'all' | 'visible' | 'hidden'>('all');
   const [filterCategory, setFilterCategory] = useState<string>('all');
   const [selectedProductId, setSelectedProductId] = useState<number | null>(null);
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [syncingAll, setSyncingAll] = useState(false);
 
   const [quickPrice, setQuickPrice] = useState('');
   const [quickAgentPrice, setQuickAgentPrice] = useState('');
   const [newCatName, setNewCatName] = useState('');
 
   const [matcherOnlyRelevant, setMatcherOnlyRelevant] = useState(true);
+  const [matcherOnlyInStock, setMatcherOnlyInStock] = useState(true);
   const [matcherServerId, setMatcherServerId] = useState<string>('all');
   const [matcherSearch, setMatcherSearch] = useState('');
 
@@ -265,58 +276,61 @@ export default function ProductsPricingView({
     lockManualPrice: true,
   });
 
-  const { categoryCounts, uncategorizedCount, publishedCount, hiddenCount, outOfStockPublished } = useMemo(() => {
+  const {
+    categoryCounts,
+    uncategorizedCount,
+    publishedCount,
+    hiddenCount,
+    inStockCount,
+    outOfStockCount,
+    stockScopedTotal,
+  } = useMemo(() => {
     const counts = new Map<number, number>();
     let uncat = 0;
     let pub = 0;
     let hid = 0;
+    let inStk = 0;
     let oos = 0;
+    let scopedTotal = 0;
+
     for (const p of products) {
+      const hasStk = isStoreProductInStock(p);
+      if (hasStk) inStk += 1;
+      else oos += 1;
+
+      if (p.isVisible && !p.isPaused) pub += 1;
+      else hid += 1;
+
+      const matchesStockMode =
+        filterStock === 'all' || (filterStock === 'in_stock' && hasStk) || (filterStock === 'out_of_stock' && !hasStk);
+      if (!matchesStockMode) continue;
+
+      scopedTotal += 1;
       if (p.categoryId === null) uncat += 1;
       else counts.set(p.categoryId, (counts.get(p.categoryId) || 0) + 1);
-      if (p.isVisible && !p.isPaused) {
-        pub += 1;
-        if (p.totalStock <= 0) oos += 1;
-      } else {
-        hid += 1;
-      }
     }
+
     return {
       categoryCounts: counts,
       uncategorizedCount: uncat,
       publishedCount: pub,
       hiddenCount: hid,
-      outOfStockPublished: oos,
+      inStockCount: inStk,
+      outOfStockCount: oos,
+      stockScopedTotal: scopedTotal,
     };
-  }, [products]);
+  }, [products, filterStock]);
 
-  const filteredProducts = useMemo(() => {
-    const list = products.filter((p) => {
-      if (filterVis === 'visible' && (!p.isVisible || p.isPaused)) return false;
-      if (filterVis === 'hidden' && p.isVisible) return false;
-      if (filterCategory === 'uncategorized') {
-        if (p.categoryId !== null) return false;
-      } else if (filterCategory !== 'all' && String(p.categoryId) !== filterCategory) {
-        return false;
-      }
-      if (search.trim()) {
-        const q = search.trim().toLowerCase();
-        const hay = `${p.titleAr} ${p.titleEn || ''} ${p.sku} ${p.categoryNameAr}`.toLowerCase();
-        if (!hay.includes(q)) return false;
-      }
-      return true;
-    });
-
-    return [...list].sort((a, b) => {
-      const aVis = a.isVisible && !a.isPaused ? 1 : 0;
-      const bVis = b.isVisible && !b.isPaused ? 1 : 0;
-      if (aVis !== bVis) return bVis - aVis;
-      if (a.providerOffers.length !== b.providerOffers.length) {
-        return b.providerOffers.length - a.providerOffers.length;
-      }
-      return a.sortOrder - b.sortOrder;
-    });
-  }, [products, filterVis, filterCategory, search]);
+  const filteredProducts = useMemo(
+    () =>
+      filterAndSortAdminStoreProducts(products, {
+        stockFilter: filterStock,
+        visFilter: filterVis,
+        categoryFilter: filterCategory,
+        search,
+      }),
+    [products, filterStock, filterVis, filterCategory, search]
+  );
 
   useEffect(() => {
     if (filteredProducts.length === 0) {
@@ -341,10 +355,17 @@ export default function ProductsPricingView({
   }, [selectedProduct?.id, selectedProduct?.retailPrice, selectedProduct?.agentPrice]);
 
   // Strictly exclude ANY provider offer already linked to a store product so no offer can ever be linked twice
-  const unlinkedAvailableOffers = useMemo(
+  const unlinkedAllOffers = useMemo(
     () => filterUnlinkedAvailableOffers(availableProviderProducts),
     [availableProviderProducts]
   );
+
+  const unlinkedAvailableOffers = useMemo(
+    () => filterProviderOffersByStock(unlinkedAllOffers, 'in_stock'),
+    [unlinkedAllOffers]
+  );
+
+  const unlinkedOutOfStockCount = Math.max(0, unlinkedAllOffers.length - unlinkedAvailableOffers.length);
 
   const smartCandidateOffers = useMemo(() => {
     if (!selectedProduct) return [];
@@ -365,7 +386,8 @@ export default function ProductsPricingView({
       .split(/[\s\-—_/()[\]]+/)
       .filter((tok) => tok.length >= 3 && !stopTokens.has(tok));
 
-    const pool = unlinkedAvailableOffers.filter((ap) => !linkedIds.has(ap.id));
+    const sourcePool = matcherOnlyInStock ? unlinkedAvailableOffers : unlinkedAllOffers;
+    const pool = sourcePool.filter((ap) => !linkedIds.has(ap.id));
 
     const scored = pool
       .map((ap) => {
@@ -400,7 +422,15 @@ export default function ProductsPricingView({
     });
 
     return scored;
-  }, [selectedProduct, unlinkedAvailableOffers, matcherOnlyRelevant, matcherServerId, matcherSearch]);
+  }, [
+    selectedProduct,
+    unlinkedAvailableOffers,
+    unlinkedAllOffers,
+    matcherOnlyInStock,
+    matcherOnlyRelevant,
+    matcherServerId,
+    matcherSearch,
+  ]);
 
   const createMatchingOffers = useMemo(() => {
     const selectedCat = categories.find((c) => String(c.id) === createForm.categoryId);
@@ -420,9 +450,6 @@ export default function ProductsPricingView({
         const aSel = createSelectedOfferIds.includes(a.id) ? 1 : 0;
         const bSel = createSelectedOfferIds.includes(b.id) ? 1 : 0;
         if (aSel !== bSel) return bSel - aSel;
-        if ((b.stockCount > 0 ? 1 : 0) !== (a.stockCount > 0 ? 1 : 0)) {
-          return (b.stockCount > 0 ? 1 : 0) - (a.stockCount > 0 ? 1 : 0);
-        }
         return Number(a.wholesalePrice) - Number(b.wholesalePrice);
       })
       .slice(0, 40);
@@ -543,6 +570,9 @@ export default function ProductsPricingView({
         }
       );
       setShowCreateModal(false);
+      if (createSelectedOfferIds.length === 0) {
+        setFilterStock('all');
+      }
       setCreateSelectedOfferIds([]);
       setCreateOfferSearch('');
       setCreateTitlePreview(null);
@@ -565,6 +595,42 @@ export default function ProductsPricingView({
       await onRefresh();
     } catch (err: any) {
       setFeedback({ type: 'err', text: err?.message || 'تعذر إنشاء المنتج.' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleSyncAllServers = async () => {
+    setSyncingAll(true);
+    setFeedback(null);
+    try {
+      const res = await apiFetch<{ ok: boolean; messageAr: string }>('/api/admin/providers/sync-all', {
+        method: 'POST',
+      });
+      setFeedback({ type: res.ok ? 'ok' : 'err', text: res.messageAr });
+      await onRefresh();
+    } catch (err: any) {
+      setFeedback({ type: 'err', text: err?.message || 'تعذر تحديث المنتجات من الخوادم.' });
+    } finally {
+      setSyncingAll(false);
+    }
+  };
+
+  const handleMoveProductOrder = async (p: AdminProductItem, delta: -1 | 1) => {
+    const idx = filteredProducts.findIndex((item) => item.id === p.id);
+    const swapped = computeSwappedProductSortOrders(filteredProducts, idx, delta);
+    if (!swapped) return;
+    setBusy(true);
+    setFeedback(null);
+    try {
+      await apiFetch('/api/admin/products/reorder', {
+        method: 'POST',
+        body: JSON.stringify({ items: swapped }),
+      });
+      setFeedback({ type: 'ok', text: `تم حفظ موضع "${p.titleAr}" في الترتيب داخل القسم.` });
+      await onRefresh();
+    } catch (err: any) {
+      setFeedback({ type: 'err', text: err?.message || 'تعذر تحديث ترتيب المنتج.' });
     } finally {
       setBusy(false);
     }
@@ -1011,6 +1077,16 @@ export default function ProductsPricingView({
             </button>
             <button
               type="button"
+              disabled={busy || syncingAll}
+              data-testid="sync-all-servers-products-btn"
+              onClick={() => void handleSyncAllServers()}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-700 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-800 disabled:opacity-50 whitespace-nowrap transition-colors"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${syncingAll ? 'animate-spin' : ''}`} />
+              <span>{syncingAll ? 'جارٍ تحديث الخوادم...' : 'تحديث جميع المنتجات من جميع الخوادم'}</span>
+            </button>
+            <button
+              type="button"
               onClick={() => {
                 setCreateForm((prev) => ({
                   ...prev,
@@ -1041,26 +1117,26 @@ export default function ProductsPricingView({
       {/* Meaning-Aware Catalog KPI Strip */}
       <div className="grid grid-cols-2 gap-3.5 lg:grid-cols-4">
         <KpiCard
-          label="منشور للمشتري"
-          value={publishedCount}
+          label="متوفر بمخزون"
+          value={inStockCount}
           valueTone="positive"
           tone="positive"
           direction="up"
-          indicatorText="نشط في البوت"
+          indicatorText="يظهر تلقائيًا"
         />
         <KpiCard
-          label="مخفي / مسودة"
-          value={hiddenCount}
+          label="مخفي لنفاد المخزون"
+          value={outOfStockCount}
+          valueTone={outOfStockCount > 0 ? 'warning' : 'positive'}
+          tone={outOfStockCount > 0 ? 'warning' : 'positive'}
+          direction="flat"
+          indicatorText={outOfStockCount > 0 ? 'يعود لترتيبه عند التوفر' : 'الكل متوفر'}
+        />
+        <KpiCard
+          label="منشور للمشتري"
+          value={publishedCount}
           tone="neutral"
-          indicatorText={`من ${products.length}`}
-        />
-        <KpiCard
-          label="منشور نافذ المخزون"
-          value={outOfStockPublished}
-          valueTone={outOfStockPublished > 0 ? 'negative' : 'positive'}
-          tone={outOfStockPublished > 0 ? 'negative' : 'positive'}
-          direction={outOfStockPublished > 0 ? 'up' : 'flat'}
-          indicatorText={outOfStockPublished > 0 ? 'يحتاج مزود' : 'متوفر بالكامل'}
+          indicatorText={`${hiddenCount} مسودة/مخفي`}
         />
         <KpiCard
           label="غير مصنف"
@@ -1085,7 +1161,7 @@ export default function ProductsPricingView({
             }`}
           >
             <span>الكل</span>
-            <span className="font-mono-num opacity-75">({products.length})</span>
+            <span className="font-mono-num opacity-75">({stockScopedTotal})</span>
           </button>
           {categories.map((cat) => {
             const active = filterCategory === String(cat.id);
@@ -1129,11 +1205,44 @@ export default function ProductsPricingView({
         {/* Product List (5 cols) */}
         <SurfacePanel className="xl:col-span-5 overflow-hidden flex flex-col">
           <div className="p-3.5 border-b border-slate-100 space-y-2.5 bg-slate-50/50">
-            <div className="flex items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center justify-between gap-2">
               <span className="text-xs font-bold text-slate-900">
                 المنتجات <span className="font-mono-num text-slate-400">({filteredProducts.length})</span>
               </span>
               <div className="inline-flex items-center gap-0.5 rounded-lg bg-slate-200/70 p-0.5">
+                {(
+                  [
+                    ['in_stock', `بمخزون (${inStockCount})`],
+                    ['out_of_stock', `نفد (${outOfStockCount})`],
+                    ['all', 'الكل'],
+                  ] as const
+                ).map(([k, lbl]) => (
+                  <button
+                    key={k}
+                    type="button"
+                    data-testid={`product-stock-filter-${k}`}
+                    onClick={() => setFilterStock(k)}
+                    className={`rounded-md px-2 py-1 text-[11px] font-semibold transition-colors ${
+                      filterStock === k ? 'bg-white text-emerald-800 shadow-xs' : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    {lbl}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="relative flex-1">
+                <Search className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
+                <input
+                  type="text"
+                  value={search}
+                  onChange={(e) => setSearch(e.target.value)}
+                  placeholder="بحث بالاسم أو SKU..."
+                  className="w-full rounded-lg border border-slate-200 bg-white pr-8 pl-3 py-1.5 text-xs focus:border-slate-900 focus:outline-none"
+                />
+              </div>
+              <div className="inline-flex items-center gap-0.5 rounded-lg bg-slate-200/70 p-0.5 shrink-0">
                 {(
                   [
                     ['all', 'الكل'],
@@ -1145,7 +1254,7 @@ export default function ProductsPricingView({
                     key={k}
                     type="button"
                     onClick={() => setFilterVis(k)}
-                    className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                    className={`rounded-md px-2 py-1 text-[11px] font-semibold transition-colors ${
                       filterVis === k ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-600 hover:text-slate-900'
                     }`}
                   >
@@ -1153,16 +1262,6 @@ export default function ProductsPricingView({
                   </button>
                 ))}
               </div>
-            </div>
-            <div className="relative">
-              <Search className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
-              <input
-                type="text"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-                placeholder="بحث بالاسم أو SKU..."
-                className="w-full rounded-lg border border-slate-200 bg-white pr-8 pl-3 py-1.5 text-xs focus:border-slate-900 focus:outline-none"
-              />
             </div>
           </div>
 
@@ -1274,6 +1373,36 @@ export default function ProductsPricingView({
                     </div>
                   </div>
                   <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                    {(() => {
+                      const selIdx = filteredProducts.findIndex((item) => item.id === selectedProduct.id);
+                      return (
+                        <div className="inline-flex items-center gap-0.5 rounded-lg border border-slate-200 bg-slate-50 p-0.5">
+                          <button
+                            type="button"
+                            disabled={busy || selIdx <= 0}
+                            onClick={() => void handleMoveProductOrder(selectedProduct, -1)}
+                            title="تقديم ترتيب المنتج للأعلى"
+                            aria-label={`تقديم ترتيب ${selectedProduct.titleAr}`}
+                            className="rounded p-1 text-slate-600 hover:bg-white hover:text-slate-900 disabled:opacity-30"
+                          >
+                            <ArrowUp className="h-3.5 w-3.5" />
+                          </button>
+                          <span className="px-1 font-mono-num text-[11px] font-bold text-slate-600" title="ترتيب المنتج">
+                            #{selectedProduct.sortOrder}
+                          </span>
+                          <button
+                            type="button"
+                            disabled={busy || selIdx === -1 || selIdx >= filteredProducts.length - 1}
+                            onClick={() => void handleMoveProductOrder(selectedProduct, 1)}
+                            title="تأخير ترتيب المنتج للأسفل"
+                            aria-label={`تأخير ترتيب ${selectedProduct.titleAr}`}
+                            className="rounded p-1 text-slate-600 hover:bg-white hover:text-slate-900 disabled:opacity-30"
+                          >
+                            <ArrowDown className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      );
+                    })()}
                     <button
                       type="button"
                       disabled={busy}
@@ -1571,28 +1700,50 @@ export default function ProductsPricingView({
               {/* Part C: Unlinked-Only Available Offers Matcher */}
               <SurfacePanel>
                 <SectionHeader
-                  title="ربط مزودين متاحين (غير مرتبطين بمنتجات أخرى)"
+                  title="ربط مزودين متاحين بمخزون (غير مرتبطين بمنتجات أخرى)"
                   icon={Sparkles}
                   action={
-                    <div className="inline-flex items-center gap-0.5 rounded-lg bg-slate-100 p-0.5">
-                      <button
-                        type="button"
-                        onClick={() => setMatcherOnlyRelevant(true)}
-                        className={`rounded-md px-2.5 py-1 text-[11px] font-semibold ${
-                          matcherOnlyRelevant ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-500'
-                        }`}
-                      >
-                        المطابقة
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setMatcherOnlyRelevant(false)}
-                        className={`rounded-md px-2.5 py-1 text-[11px] font-semibold ${
-                          !matcherOnlyRelevant ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-500'
-                        }`}
-                      >
-                        الكل المتاح ({unlinkedAvailableOffers.length})
-                      </button>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      <div className="inline-flex items-center gap-0.5 rounded-lg bg-slate-100 p-0.5">
+                        <button
+                          type="button"
+                          onClick={() => setMatcherOnlyInStock(true)}
+                          className={`rounded-md px-2 py-1 text-[11px] font-semibold ${
+                            matcherOnlyInStock ? 'bg-white text-emerald-800 shadow-xs' : 'text-slate-500'
+                          }`}
+                        >
+                          بمخزون ({unlinkedAvailableOffers.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setMatcherOnlyInStock(false)}
+                          className={`rounded-md px-2 py-1 text-[11px] font-semibold ${
+                            !matcherOnlyInStock ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-500'
+                          }`}
+                        >
+                          الكل ({unlinkedAllOffers.length})
+                        </button>
+                      </div>
+                      <div className="inline-flex items-center gap-0.5 rounded-lg bg-slate-100 p-0.5">
+                        <button
+                          type="button"
+                          onClick={() => setMatcherOnlyRelevant(true)}
+                          className={`rounded-md px-2.5 py-1 text-[11px] font-semibold ${
+                            matcherOnlyRelevant ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-500'
+                          }`}
+                        >
+                          المطابقة
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setMatcherOnlyRelevant(false)}
+                          className={`rounded-md px-2.5 py-1 text-[11px] font-semibold ${
+                            !matcherOnlyRelevant ? 'bg-white text-slate-900 shadow-xs' : 'text-slate-500'
+                          }`}
+                        >
+                          الكل المتاح
+                        </button>
+                      </div>
                     </div>
                   }
                 />
@@ -1663,16 +1814,32 @@ export default function ProductsPricingView({
                     ))}
                     {smartCandidateOffers.length === 0 && (
                       <div className="p-5 text-center text-xs text-slate-400 space-y-1.5">
-                        <div>لا توجد عروض مطابقة.</div>
-                        {matcherOnlyRelevant && (
-                          <button
-                            type="button"
-                            onClick={() => setMatcherOnlyRelevant(false)}
-                            className="text-emerald-700 font-semibold hover:underline"
-                          >
-                            عرض جميع العروض
-                          </button>
-                        )}
+                        <div>
+                          لا توجد عروض مطابقة متوفرة بالمخزون حاليًا
+                          {matcherOnlyInStock && unlinkedOutOfStockCount > 0
+                            ? ` (تم إخفاء ${unlinkedOutOfStockCount} عرض نافد المخزون تلقائيًا).`
+                            : '.'}
+                        </div>
+                        <div className="flex items-center justify-center gap-3">
+                          {matcherOnlyRelevant && (
+                            <button
+                              type="button"
+                              onClick={() => setMatcherOnlyRelevant(false)}
+                              className="text-emerald-700 font-semibold hover:underline"
+                            >
+                              عرض جميع العروض المتوفرة
+                            </button>
+                          )}
+                          {matcherOnlyInStock && unlinkedOutOfStockCount > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => setMatcherOnlyInStock(false)}
+                              className="text-slate-600 font-semibold hover:underline"
+                            >
+                              إظهار نافد المخزون ({unlinkedOutOfStockCount})
+                            </button>
+                          )}
+                        </div>
                       </div>
                     )}
                   </div>
@@ -2134,7 +2301,7 @@ export default function ProductsPricingView({
                 </button>
               </div>
 
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-4">
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">القسم</label>
                   <select
@@ -2149,6 +2316,20 @@ export default function ProductsPricingView({
                       </option>
                     ))}
                   </select>
+                </div>
+                <div>
+                  <label htmlFor="edit-product-sort-order" className="block text-xs font-semibold text-slate-700 mb-1">
+                    الترتيب بالمتجر
+                  </label>
+                  <input
+                    id="edit-product-sort-order"
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={editForm.sortOrder}
+                    onChange={(e) => setEditForm({ ...editForm, sortOrder: Math.max(0, Number(e.target.value) || 0) })}
+                    className="w-full rounded-xl border border-slate-300 px-3 py-2 text-sm font-mono-num focus:border-slate-900 focus:outline-none"
+                  />
                 </div>
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">المدة</label>

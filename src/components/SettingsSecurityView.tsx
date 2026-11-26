@@ -14,6 +14,7 @@ import BinancePayAdminPanel, {
   type BinanceAdminData,
   type PaymentMethodItem,
 } from './BinancePayAdminPanel';
+import SecretsVaultPanel from './SecretsVaultPanel';
 import {
   PageHeader,
   SegmentedTabs,
@@ -34,6 +35,7 @@ interface SettingsSecurityViewProps {
   canManageSettings?: boolean;
   canManagePayments?: boolean;
   canViewAudit?: boolean;
+  isOwner?: boolean;
   onPreviewCustomerBot: (lang: 'ar' | 'en') => void;
   onRefresh: () => Promise<void>;
   onUserUpdated?: (user: SessionUser) => void;
@@ -52,7 +54,7 @@ const ALERT_LABELS: Record<string, string> = {
   duplicate_txid: 'محاولة تكرار TxID / Transaction ID',
 };
 
-type SettingsTab = 'binance' | 'languages' | 'security';
+type SettingsTab = 'binance' | 'languages' | 'secrets' | 'security';
 
 export default function SettingsSecurityView({
   storeProfile,
@@ -64,6 +66,7 @@ export default function SettingsSecurityView({
   canManageSettings = true,
   canManagePayments = true,
   canViewAudit = true,
+  isOwner = false,
   onPreviewCustomerBot,
   onRefresh,
   onUserUpdated,
@@ -194,6 +197,7 @@ export default function SettingsSecurityView({
   const visibleTabs = [
     ...(canManagePayments ? [{ id: 'binance' as const, label: 'Binance ID والدفع', icon: Wallet }] : []),
     ...(canManageSettings ? [{ id: 'languages' as const, label: 'اللغات والمتجر', icon: Globe }] : []),
+    ...(isOwner ? [{ id: 'secrets' as const, label: 'خزينة الأسرار', icon: KeyRound }] : []),
     ...(canViewAudit ? [{ id: 'security' as const, label: 'الأمان والتدقيق', icon: ShieldCheck }] : []),
   ];
 
@@ -226,6 +230,11 @@ export default function SettingsSecurityView({
           paymentMethods={paymentMethods}
           onRefresh={onRefresh}
         />
+      )}
+
+      {/* TAB: OWNER PREVIEW SECRETS VAULT */}
+      {activeTab === 'secrets' && isOwner && (
+        <SecretsVaultPanel onRefreshWorkspace={onRefresh} />
       )}
 
       {/* TAB 2: BILINGUAL BOT SETTINGS (AR / EN) + STORE IDENTITY */}

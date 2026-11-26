@@ -24,6 +24,11 @@ import {
   type ServerGridStatusFilter,
 } from '../lib/serverGridUtils';
 import {
+  filterProviderOffersByStock,
+  isProviderOfferInStock,
+  type StockVisibilityFilter,
+} from '../lib/stockVisibilityUtils';
+import {
   FeedbackBanner,
   KpiCard,
   PageHeader,
@@ -56,6 +61,7 @@ export interface ProviderItem {
   hasApiKey: boolean;
   keyFingerprint: string | null;
   productsCount: number;
+  inStockProductsCount?: number;
   publishedCount: number;
   hiddenCount: number;
   ordersCount: number;
@@ -110,6 +116,8 @@ export default function ProvidersView({
   const [selectedServerId, setSelectedServerId] = useState<number | null>(null);
   const [selectedBrandKey, setSelectedBrandKey] = useState<string>('all');
   const [offerSearch, setOfferSearch] = useState('');
+  const [offerStockFilter, setOfferStockFilter] = useState<StockVisibilityFilter>('in_stock');
+  const [syncingAll, setSyncingAll] = useState(false);
 
   // Compact App-Icon Grid controls (purely UI presentation & filtering)
   const [serverSearch, setServerSearch] = useState('');
@@ -123,15 +131,21 @@ export default function ProvidersView({
       return;
     }
     if (!selectedServerId || !providers.some((p) => p.id === selectedServerId)) {
-      const withOffers = providers.find((p) => p.productsCount > 0) || providers[0];
+      const withOffers =
+        providers.find((p) => (p.inStockProductsCount ?? p.productsCount) > 0) || providers[0];
       setSelectedServerId(withOffers.id);
     }
   }, [providers, selectedServerId]);
 
+  const inStockOffersTotal = useMemo(
+    () => filterProviderOffersByStock(availableProviderProducts, 'in_stock').length,
+    [availableProviderProducts]
+  );
+
   const kpis = useMemo(() => {
     const connected = providers.filter((p) => p.isEnabled && p.status === 'connected').length;
     const disconnected = providers.length - connected;
-    const withOffers = providers.filter((p) => p.productsCount > 0).length;
+    const withOffers = providers.filter((p) => (p.inStockProductsCount ?? p.productsCount) > 0).length;
     const errors = providers.filter((p) => p.status === 'error').length;
     const totalBalance = providers.reduce((s, p) => s + Number(p.cachedBalance || 0), 0);
     return {
@@ -140,9 +154,9 @@ export default function ProvidersView({
       withOffers,
       errors,
       totalBalance: totalBalance.toFixed(2),
-      totalOffers: availableProviderProducts.length,
+      totalOffers: inStockOffersTotal,
     };
-  }, [providers, availableProviderProducts]);
+  }, [providers, inStockOffersTotal]);
 
   const filteredServers = useMemo(
     () =>
@@ -168,10 +182,22 @@ export default function ProvidersView({
     [providers, selectedServerId]
   );
 
-  const serverOffers = useMemo(() => {
+  const allServerOffers = useMemo(() => {
     if (!selectedServerId) return [];
     return availableProviderProducts.filter((o) => o.providerId === selectedServerId);
   }, [availableProviderProducts, selectedServerId]);
+
+  const inStockServerOffersCount = useMemo(
+    () => allServerOffers.filter((o) => isProviderOfferInStock(o)).length,
+    [allServerOffers]
+  );
+
+  const outOfStockServerOffersCount = Math.max(0, allServerOffers.length - inStockServerOffersCount);
+
+  const serverOffers = useMemo(
+    () => filterProviderOffersByStock(allServerOffers, offerStockFilter),
+    [allServerOffers, offerStockFilter]
+  );
 
   const brandBuckets = useMemo(() => groupOffersByBrand(serverOffers), [serverOffers]);
 
@@ -226,6 +252,22 @@ export default function ProvidersView({
       setFeedback({ type: 'err', text: err?.message || 'فشلت مزامنة المنتجات.' });
     } finally {
       setBusyId(null);
+    }
+  };
+
+  const handleSyncAllServers = async () => {
+    setSyncingAll(true);
+    setFeedback(null);
+    try {
+      const res = await apiFetch<{ ok: boolean; messageAr: string }>('/api/admin/providers/sync-all', {
+        method: 'POST',
+      });
+      setFeedback({ type: res.ok ? 'ok' : 'err', text: res.messageAr });
+      await onRefresh();
+    } catch (err: any) {
+      setFeedback({ type: 'err', text: err?.message || 'تعذر تحديث المنتجات من جميع الخوادم.' });
+    } finally {
+      setSyncingAll(false);
     }
   };
 
@@ -422,9 +464,19 @@ export default function ProvidersView({
               onChange={setActiveTab}
               items={[
                 { id: 'servers', label: 'الخوادم', count: providers.length, icon: Server },
-                { id: 'offers', label: 'تصفح العروض', count: availableProviderProducts.length, icon: PackageSearch },
+                { id: 'offers', label: 'تصفح العروض', count: inStockOffersTotal, icon: PackageSearch },
               ]}
             />
+            <button
+              type="button"
+              disabled={syncingAll || busyId !== null}
+              data-testid="sync-all-servers-btn"
+              onClick={() => void handleSyncAllServers()}
+              className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-700 px-3.5 py-2 text-xs font-semibold text-white hover:bg-emerald-800 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${syncingAll ? 'animate-spin' : ''}`} />
+              <span>{syncingAll ? 'جارٍ التحديث...' : 'تحديث جميع المنتجات من جميع الخوادم'}</span>
+            </button>
             <button
               type="button"
               onClick={() => setShowAddModal(true)}
@@ -466,10 +518,11 @@ export default function ProvidersView({
           indicatorText="USDT"
         />
         <KpiCard
-          label="العروض المتاحة"
+          label="العروض المتوفرة بمخزون"
           value={kpis.totalOffers}
-          tone="neutral"
-          indicatorText="عرض"
+          valueTone="positive"
+          tone="positive"
+          indicatorText={`من إجمالي ${availableProviderProducts.length} عرض`}
         />
       </div>
 
@@ -639,9 +692,9 @@ export default function ProvidersView({
                           </div>
                         </div>
                         <div className="min-w-0">
-                          <div className="text-[9px] text-slate-400 leading-none">العروض</div>
+                          <div className="text-[9px] text-slate-400 leading-none">المتوفر</div>
                           <div className="mt-0.5 font-mono-num text-[11px] font-semibold text-slate-800 tabular-nums">
-                            {p.productsCount}
+                            {p.inStockProductsCount ?? p.productsCount}
                           </div>
                         </div>
                         <div className="min-w-0">
@@ -688,12 +741,12 @@ export default function ProvidersView({
                         <button
                           type="button"
                           onClick={() => openOffersForServer(p)}
-                          title={`العروض المسحوبة من ${p.name}`}
+                          title={`العروض المتوفرة بمخزون من ${p.name}`}
                           aria-label={`العروض المسحوبة من ${p.name}`}
                           className="inline-flex items-center justify-center gap-1 rounded-lg border border-slate-200 bg-white px-2 py-1.5 text-[11px] font-semibold text-slate-700 hover:bg-slate-50 transition-colors whitespace-nowrap min-w-0"
                         >
                           <PackageSearch className="h-3 w-3 shrink-0 text-slate-500" />
-                          <span className="font-mono-num truncate">{p.productsCount}</span>
+                          <span className="font-mono-num truncate">{p.inStockProductsCount ?? p.productsCount}</span>
                         </button>
                       </div>
 
@@ -794,7 +847,7 @@ export default function ProvidersView({
                     >
                       <span>{p.name}</span>
                       <span className={`font-mono-num text-[11px] ${isSelected ? 'text-slate-300' : 'text-slate-400'}`}>
-                        ({p.productsCount})
+                        ({p.inStockProductsCount ?? p.productsCount})
                       </span>
                     </button>
                   );
@@ -824,7 +877,7 @@ export default function ProvidersView({
               )}
             </div>
 
-            {selectedServer && serverOffers.length === 0 ? (
+            {selectedServer && allServerOffers.length === 0 ? (
               <div className="py-10 text-center space-y-3">
                 <div className="text-sm font-semibold text-slate-700">
                   لا توجد عروض مسحوبة من «{selectedServer.name}» بعد
@@ -856,39 +909,33 @@ export default function ProvidersView({
             ) : (
               selectedServer && (
                 <div className="space-y-3.5">
-                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                    <div className="flex flex-wrap gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() => setSelectedBrandKey('all')}
-                        className={`rounded-lg border px-2.5 py-1 text-xs font-semibold transition-colors ${
-                          selectedBrandKey === 'all'
-                            ? 'border-emerald-700 bg-emerald-700 text-white'
-                            : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
-                        }`}
-                      >
-                        الكل ({serverOffers.length})
-                      </button>
-                      {brandBuckets.map((bucket) => {
-                        const active = selectedBrandKey === bucket.brand.key;
-                        return (
-                          <button
-                            key={bucket.brand.key}
-                            type="button"
-                            onClick={() => setSelectedBrandKey(bucket.brand.key)}
-                            className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-xs font-semibold transition-colors ${
-                              active
-                                ? 'border-emerald-700 bg-emerald-700 text-white'
-                                : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
-                            }`}
-                          >
-                            <span>{bucket.brand.labelAr}</span>
-                            <span className="font-mono-num opacity-75">({bucket.count})</span>
-                          </button>
-                        );
-                      })}
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="inline-flex items-center gap-0.5 rounded-lg bg-slate-100 p-0.5">
+                      {(
+                        [
+                          ['in_stock', `بمخزون فقط (${inStockServerOffersCount})`],
+                          ['out_of_stock', `نفد المخزون (${outOfStockServerOffersCount})`],
+                          ['all', `الكل (${allServerOffers.length})`],
+                        ] as const
+                      ).map(([k, lbl]) => (
+                        <button
+                          key={k}
+                          type="button"
+                          data-testid={`provider-offer-stock-filter-${k}`}
+                          onClick={() => {
+                            setOfferStockFilter(k);
+                            setSelectedBrandKey('all');
+                          }}
+                          className={`rounded-md px-2.5 py-1 text-[11px] font-semibold transition-colors ${
+                            offerStockFilter === k
+                              ? 'bg-white text-emerald-800 shadow-xs'
+                              : 'text-slate-600 hover:text-slate-900'
+                          }`}
+                        >
+                          {lbl}
+                        </button>
+                      ))}
                     </div>
-
                     <div className="relative w-full sm:w-60 shrink-0">
                       <Search className="pointer-events-none absolute right-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-slate-400" />
                       <input
@@ -900,6 +947,57 @@ export default function ProvidersView({
                       />
                     </div>
                   </div>
+
+                  {serverOffers.length === 0 ? (
+                    <div className="py-8 text-center space-y-2 rounded-xl border border-slate-200/80 bg-slate-50/50">
+                      <div className="text-xs font-semibold text-slate-700">
+                        {offerStockFilter === 'in_stock'
+                          ? `جميع عروض «${selectedServer.name}» نفد مخزونها حاليًا (${outOfStockServerOffersCount} مخفي تلقائيًا) وستعود تلقائيًا فور توفر المخزون.`
+                          : 'لا توجد عروض في هذا التصنيف.'}
+                      </div>
+                      {offerStockFilter === 'in_stock' && outOfStockServerOffersCount > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => setOfferStockFilter('out_of_stock')}
+                          className="text-xs font-semibold text-emerald-700 hover:underline"
+                        >
+                          عرض العروض نافدة المخزون ({outOfStockServerOffersCount})
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    <>
+                      <div className="flex flex-wrap gap-1.5">
+                        <button
+                          type="button"
+                          onClick={() => setSelectedBrandKey('all')}
+                          className={`rounded-lg border px-2.5 py-1 text-xs font-semibold transition-colors ${
+                            selectedBrandKey === 'all'
+                              ? 'border-emerald-700 bg-emerald-700 text-white'
+                              : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                          }`}
+                        >
+                          الكل ({serverOffers.length})
+                        </button>
+                        {brandBuckets.map((bucket) => {
+                          const active = selectedBrandKey === bucket.brand.key;
+                          return (
+                            <button
+                              key={bucket.brand.key}
+                              type="button"
+                              onClick={() => setSelectedBrandKey(bucket.brand.key)}
+                              className={`inline-flex items-center gap-1 rounded-lg border px-2.5 py-1 text-xs font-semibold transition-colors ${
+                                active
+                                  ? 'border-emerald-700 bg-emerald-700 text-white'
+                                  : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
+                              }`}
+                            >
+                              <span>{bucket.brand.labelAr}</span>
+                              <span className="font-mono-num opacity-75">({bucket.count})</span>
+                            </button>
+                          );
+                        })}
+                      </div>
 
                   <div className="overflow-x-auto border border-slate-200/80 rounded-xl">
                     <table className="w-full text-right border-collapse">
@@ -1012,6 +1110,8 @@ export default function ProvidersView({
                       </tbody>
                     </table>
                   </div>
+                    </>
+                  )}
                 </div>
               )
             )}

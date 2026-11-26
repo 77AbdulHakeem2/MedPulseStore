@@ -13,6 +13,7 @@ import {
   type AdminPermissionKey,
   type AppUserRole,
 } from '../server/rbacEngine.ts';
+import { getRuntimeVaultValue } from '../server/runtimeSecretStore.ts';
 
 export type UserRole = AppUserRole;
 
@@ -59,7 +60,7 @@ async function upsertFirebaseUser(
   emailVerified: boolean,
   name?: string
 ): Promise<AuthUser> {
-  const ownerEmail = normalizeEmail(process.env.OWNER_EMAIL);
+  const ownerEmail = normalizeEmail(getRuntimeVaultValue('ownerEmail') || process.env.OWNER_EMAIL);
   const email = normalizeEmail(rawEmail);
   const hasRealEmail = Boolean(email && !email.endsWith('@firebase.local'));
   const isConfiguredOwner = Boolean(ownerEmail && hasRealEmail && emailVerified && email === ownerEmail);

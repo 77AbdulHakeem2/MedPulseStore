@@ -678,6 +678,7 @@ export interface BrowserFilterOptions {
   search?: string;
   category?: string;
   status?: 'all' | 'not_imported' | 'imported';
+  stock?: 'in_stock' | 'all' | 'out_of_stock';
   page?: number;
   pageSize?: number;
 }
@@ -688,13 +689,30 @@ export function filterAndPaginateSupplierBrowserItems(
 ): {
   items: SupplierBrowserItem[];
   totalMatched: number;
+  inStockCatalogCount: number;
+  outOfStockCatalogCount: number;
   page: number;
   pageSize: number;
   totalPages: number;
   distinctCategories: string[];
 } {
-  const catSet = new Set<string>();
+  const stockFilter = opts.stock || 'all';
+  let inStockCatalogCount = 0;
+  let outOfStockCatalogCount = 0;
+  const stockScopedItems: SupplierBrowserItem[] = [];
+
   for (const it of items) {
+    const hasStock = it.isAvailable && Number(it.stockCount || 0) > 0;
+    if (hasStock) inStockCatalogCount += 1;
+    else outOfStockCatalogCount += 1;
+
+    if (stockFilter === 'in_stock' && !hasStock) continue;
+    if (stockFilter === 'out_of_stock' && hasStock) continue;
+    stockScopedItems.push(it);
+  }
+
+  const catSet = new Set<string>();
+  for (const it of stockScopedItems) {
     const label = (it.categoryName || it.productType || '').trim();
     if (label) catSet.add(label);
   }
@@ -704,7 +722,7 @@ export function filterAndPaginateSupplierBrowserItems(
   const catFilter = (opts.category || '').trim().toLowerCase();
   const statusFilter = opts.status || 'all';
 
-  const matched = items.filter((it) => {
+  const matched = stockScopedItems.filter((it) => {
     if (statusFilter === 'imported' && it.importStatus !== 'imported') return false;
     if (statusFilter === 'not_imported' && it.importStatus !== 'not_imported') return false;
     if (catFilter && catFilter !== 'all') {
@@ -729,6 +747,8 @@ export function filterAndPaginateSupplierBrowserItems(
   return {
     items: matched.slice(start, start + pageSize),
     totalMatched,
+    inStockCatalogCount,
+    outOfStockCatalogCount,
     page,
     pageSize,
     totalPages,

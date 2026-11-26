@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { getRuntimeVaultValue } from './runtimeSecretStore.ts';
 
 const ALGORITHM = 'aes-256-gcm';
 
@@ -13,12 +14,16 @@ function getEncryptionKey(): Buffer {
 const RUNTIME_SESSION_SECRET = crypto.randomBytes(32).toString('hex');
 
 function getSessionSecret(): string {
+  const fromVault = getRuntimeVaultValue('sessionSigningSecret');
   const configured = (process.env.SESSION_SIGNING_SECRET || '').trim();
-  return configured || RUNTIME_SESSION_SECRET;
+  return fromVault || configured || RUNTIME_SESSION_SECRET;
 }
 
 export function isPersistentSessionSecretConfigured(): boolean {
-  return Boolean((process.env.SESSION_SIGNING_SECRET || '').trim());
+  return Boolean(
+    getRuntimeVaultValue('sessionSigningSecret') ||
+      (process.env.SESSION_SIGNING_SECRET || '').trim()
+  );
 }
 
 export function encryptSecret(plaintext: string): string {

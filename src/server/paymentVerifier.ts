@@ -1,10 +1,22 @@
 import Decimal from 'decimal.js';
 import { verifyHmacSha256 } from './crypto.ts';
+import { getRuntimeVaultValue } from './runtimeSecretStore.ts';
 
 export const OFFICIAL_USDT_CONTRACTS: Record<string, string> = {
   TRC20: process.env.USDT_TRC20_CONTRACT || 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t',
   BEP20: process.env.USDT_BEP20_CONTRACT || '0x55d398326f99059fF775485246999027B3197955',
 };
+
+export function getOfficialUsdtContract(network: 'TRC20' | 'BEP20'): string {
+  if (network === 'TRC20') {
+    return getRuntimeVaultValue('usdtTrc20Contract') || OFFICIAL_USDT_CONTRACTS.TRC20;
+  }
+  return getRuntimeVaultValue('usdtBep20Contract') || OFFICIAL_USDT_CONTRACTS.BEP20;
+}
+
+export function getBscScanApiKey(): string {
+  return getRuntimeVaultValue('bscscanApiKey') || (process.env.BSCSCAN_API_KEY || '').trim();
+}
 
 export interface OnChainTxSnapshot {
   txHash: string;
@@ -190,8 +202,9 @@ export function verifyBinancePayWebhook(params: {
 export async function fetchTrc20TransactionFromTronGrid(txHash: string): Promise<OnChainTxSnapshot | null> {
   try {
     const headers: Record<string, string> = { Accept: 'application/json' };
-    if (process.env.TRONGRID_API_KEY) {
-      headers['TRON-PRO-API-KEY'] = process.env.TRONGRID_API_KEY;
+    const tronGridKey = getRuntimeVaultValue('trongridApiKey') || (process.env.TRONGRID_API_KEY || '').trim();
+    if (tronGridKey) {
+      headers['TRON-PRO-API-KEY'] = tronGridKey;
     }
     const res = await fetch(`https://api.trongrid.io/v1/transactions/${encodeURIComponent(txHash)}/events`, {
       headers,

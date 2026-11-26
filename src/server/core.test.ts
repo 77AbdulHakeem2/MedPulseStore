@@ -143,9 +143,25 @@ import {
   verifyPasswordScrypt,
 } from './rbacEngine.ts';
 import {
+  isPersistentSessionSecretConfigured,
   signSessionToken,
   verifySessionToken,
 } from './crypto.ts';
+import {
+  clearAllRuntimeVaultValues,
+  clearRuntimeVaultValue,
+  getVaultKeyDefinition,
+  isEnvOnlySecretName,
+  resolveVaultOrEnv,
+  setRuntimeVaultValue,
+} from './runtimeSecretStore.ts';
+import {
+  computeSwappedProductSortOrders,
+  filterAndSortAdminStoreProducts,
+  filterProviderOffersByStock,
+  isProviderOfferInStock,
+  isStoreProductInStock,
+} from '../lib/stockVisibilityUtils.ts';
 import {
   parseReferralStartPayload,
   buildTelegramReferralLink,
@@ -4013,4 +4029,204 @@ test('53. Signed HMAC session tokens embed tokenVersion, verify cleanly, and rej
     })
   ).toString('base64url');
   assert.equal(verifySessionToken(`raqm.${fakePayload}.${parts[2]}`), null);
+});
+
+test('54. Stock-only provider offers & store products auto-hide on 0 and restore to exact category & sortOrder on restock', () => {
+  // 1. Provider offers: only stockCount > 0 and isActiveAtProvider !== false appear in 'in_stock'
+  const offers = [
+    { id: 1, rawName: 'Gemini 6M — S1', stockCount: 14, isActiveAtProvider: true },
+    { id: 2, rawName: 'ChatGPT Plus — S2', stockCount: 0, isActiveAtProvider: true },
+    { id: 3, rawName: 'Canva Pro — S3', stockCount: 8, isActiveAtProvider: false },
+  ];
+  assert.deepEqual(
+    filterProviderOffersByStock(offers, 'in_stock').map((o) => o.id),
+    [1]
+  );
+  assert.deepEqual(
+    filterProviderOffersByStock(offers, 'out_of_stock').map((o) => o.id),
+    [2, 3]
+  );
+  assert.equal(isProviderOfferInStock({ stockCount: 5, isActiveAtProvider: true }), true);
+  assert.equal(isProviderOfferInStock({ stockCount: 0, isActiveAtProvider: true }), false);
+
+  // Restocking offer #2 (> 0) automatically brings it back into in_stock view
+  const restockedOffers = offers.map((o) =>
+    o.id === 2 ? { ...o, stockCount: 25, isActiveAtProvider: true } : o
+  );
+  assert.deepEqual(
+    filterProviderOffersByStock(restockedOffers, 'in_stock').map((o) => o.id),
+    [1, 2]
+  );
+
+  // 2. Store products keep exact categoryId & sortOrder across out-of-stock -> restock cycle
+  const catalogBefore = [
+    { id: 101, sku: 'S1', categoryId: 7, categoryNameAr: 'Gemini', sortOrder: 10, isVisible: true, totalStock: 5, titleAr: 'Gemini 1M' },
+    { id: 102, sku: 'S2', categoryId: 7, categoryNameAr: 'Gemini', sortOrder: 20, isVisible: true, totalStock: 3, titleAr: 'Gemini 6M' },
+    { id: 103, sku: 'S3', categoryId: 7, categoryNameAr: 'Gemini', sortOrder: 30, isVisible: true, totalStock: 8, titleAr: 'Gemini 12M' },
+  ];
+
+  assert.equal(isStoreProductInStock(catalogBefore[1]), true);
+  assert.deepEqual(
+    filterAndSortAdminStoreProducts(catalogBefore, { stockFilter: 'in_stock', categoryFilter: '7' }).map((p) => p.id),
+    [101, 102, 103]
+  );
+
+  // Middle product (#102, sortOrder 20) runs out of stock -> automatically hidden from catalog & buyer DTO
+  const catalogOutOfStock = catalogBefore.map((p) => (p.id === 102 ? { ...p, totalStock: 0 } : p));
+  assert.deepEqual(
+    filterAndSortAdminStoreProducts(catalogOutOfStock, { stockFilter: 'in_stock', categoryFilter: '7' }).map((p) => p.id),
+    [101, 103]
+  );
+  const dtoWhenEmpty = toCustomerProductDTO({
+    id: 102,
+    sku: 'S2',
+    categoryId: 7,
+    categoryNameAr: 'Gemini',
+    categoryNameEn: 'Gemini',
+    titleAr: 'Gemini 6M',
+    titleEn: 'Gemini 6M',
+    descriptionAr: 'desc',
+    descriptionEn: 'desc',
+    imageUrl: null,
+    warrantyLabelAr: 'w',
+    warrantyLabelEn: 'w',
+    durationLabel: '6M',
+    deliveryType: 'code',
+    retailPrice: '5.00',
+    promoPrice: null,
+    availableStock: 0,
+    isVisible: true,
+    isPaused: false,
+    autoHideOutOfStock: true,
+    isFeaturedOffer: false,
+    lang: 'ar',
+  });
+  assert.equal(dtoWhenEmpty, null);
+
+  // Stock refills for #102 -> returns to exact slot #2 (between #101 and #103) inside category 7!
+  const catalogRestocked = catalogOutOfStock.map((p) => (p.id === 102 ? { ...p, totalStock: 12 } : p));
+  const restoredIds = filterAndSortAdminStoreProducts(catalogRestocked, {
+    stockFilter: 'in_stock',
+    categoryFilter: '7',
+  }).map((p) => p.id);
+  assert.deepEqual(restoredIds, [101, 102, 103]);
+
+  const dtoRestored = toCustomerProductDTO({
+    id: 102,
+    sku: 'S2',
+    categoryId: 7,
+    categoryNameAr: 'Gemini',
+    categoryNameEn: 'Gemini',
+    titleAr: 'Gemini 6M',
+    titleEn: 'Gemini 6M',
+    descriptionAr: 'desc',
+    descriptionEn: 'desc',
+    imageUrl: null,
+    warrantyLabelAr: 'w',
+    warrantyLabelEn: 'w',
+    durationLabel: '6M',
+    deliveryType: 'code',
+    retailPrice: '5.00',
+    promoPrice: null,
+    availableStock: 12,
+    isVisible: true,
+    isPaused: false,
+    autoHideOutOfStock: true,
+    isFeaturedOffer: false,
+    lang: 'ar',
+  });
+  assert.ok(dtoRestored);
+  assert.equal(dtoRestored.categoryId, 7);
+
+  // Swapping product order produces clean sequential sortOrder values
+  const swapped = computeSwappedProductSortOrders(catalogBefore, 2, -1);
+  assert.deepEqual(swapped, [
+    { id: 101, sortOrder: 10 },
+    { id: 103, sortOrder: 20 },
+    { id: 102, sortOrder: 30 },
+  ]);
+});
+
+test('55. SupplierProductBrowser stock filter hides out-of-stock offers by default and surfaces restocked offers cleanly', () => {
+  const catalog = normalizeRichSupplierCatalog([
+    { id: 'stk-1', name: 'Claude Pro Available', price: '12.00', stock: 9, category: 'AI' },
+    { id: 'oos-1', name: 'ChatGPT Team Empty', price: '8.00', stock: 0, category: 'AI' },
+  ]);
+  const browserItems = catalog.map((c) => buildSupplierBrowserItem(c, { existingLink: null }));
+
+  const inStockOnly = filterAndPaginateSupplierBrowserItems(browserItems, { stock: 'in_stock' });
+  assert.equal(inStockOnly.inStockCatalogCount, 1);
+  assert.equal(inStockOnly.outOfStockCatalogCount, 1);
+  assert.deepEqual(
+    inStockOnly.items.map((i) => i.externalProductId),
+    ['stk-1']
+  );
+
+  const oosOnly = filterAndPaginateSupplierBrowserItems(browserItems, { stock: 'out_of_stock' });
+  assert.deepEqual(
+    oosOnly.items.map((i) => i.externalProductId),
+    ['oos-1']
+  );
+});
+
+test('56. Preview Secrets Vault overrides optional env secrets, locks TELEGRAM_BOT_TOKEN & TELEGRAM_OWNER_IDS to env, and signs durable session tokens', () => {
+  clearAllRuntimeVaultValues();
+
+  // Env-only secrets are strictly blocked from Preview Vault
+  assert.equal(isEnvOnlySecretName('TELEGRAM_BOT_TOKEN'), true);
+  assert.equal(isEnvOnlySecretName('TELEGRAM_OWNER_IDS'), true);
+  assert.equal(isEnvOnlySecretName('ADMIN_TELEGRAM_IDS'), true);
+  assert.equal(isEnvOnlySecretName('botToken'), true);
+  assert.equal(isEnvOnlySecretName('ownerTelegramIds'), true);
+  assert.equal(getVaultKeyDefinition('TELEGRAM_BOT_TOKEN'), undefined);
+  assert.equal(getVaultKeyDefinition('TELEGRAM_OWNER_IDS'), undefined);
+
+  // All non-Telegram-token/owner secrets are supported cleanly in Preview Vault
+  assert.ok(getVaultKeyDefinition('sessionSigningSecret'));
+  assert.ok(getVaultKeyDefinition('trongridApiKey'));
+  assert.ok(getVaultKeyDefinition('bscscanApiKey'));
+  assert.ok(getVaultKeyDefinition('telegramWebhookSecret'));
+  assert.ok(getVaultKeyDefinition('binancePaySecretKey'));
+  assert.ok(getVaultKeyDefinition('adminPasscode'));
+
+  const prevTronEnv = process.env.TRONGRID_API_KEY;
+  try {
+    process.env.TRONGRID_API_KEY = 'env-tron-key-123';
+    assert.deepEqual(resolveVaultOrEnv('trongridApiKey', 'TRONGRID_API_KEY'), {
+      value: 'env-tron-key-123',
+      source: 'env',
+    });
+
+    setRuntimeVaultValue('trongridApiKey', 'preview-tron-key-999');
+    assert.deepEqual(resolveVaultOrEnv('trongridApiKey', 'TRONGRID_API_KEY'), {
+      value: 'preview-tron-key-999',
+      source: 'preview_vault',
+    });
+
+    clearRuntimeVaultValue('trongridApiKey');
+    assert.deepEqual(resolveVaultOrEnv('trongridApiKey', 'TRONGRID_API_KEY'), {
+      value: 'env-tron-key-123',
+      source: 'env',
+    });
+  } finally {
+    if (prevTronEnv === undefined) delete process.env.TRONGRID_API_KEY;
+    else process.env.TRONGRID_API_KEY = prevTronEnv;
+  }
+
+  // Vault-persisted sessionSigningSecret persists & verifies tokens cleanly
+  setRuntimeVaultValue('sessionSigningSecret', 'a1b2c3d4e5f60708090a0b0c0d0e0f10');
+  assert.equal(isPersistentSessionSecretConfigured(), true);
+  const tok = signSessionToken({
+    uid: 'local:owner-raqm',
+    userId: 1,
+    email: 'owner@raqm.store',
+    role: 'owner',
+    displayName: 'Owner',
+    tv: 1,
+  });
+  const verified = verifySessionToken(tok);
+  assert.ok(verified);
+  assert.equal(verified?.userId, 1);
+
+  clearAllRuntimeVaultValues();
 });

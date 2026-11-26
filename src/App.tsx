@@ -1106,6 +1106,7 @@ export default function App() {
                 canManageSettings={hasStaffPermission(user, 'settings:manage')}
                 canManagePayments={hasAnyStaffPermission(user, ['deposits:approve', 'settings:manage'])}
                 canViewAudit={hasStaffPermission(user, 'audit:view')}
+                isOwner={user.role === 'owner'}
                 onPreviewCustomerBot={(lang) => {
                   setTelegramPreview((prev) => ({ mode: 'customer', lang, nonce: prev.nonce + 1 }));
                   setSection('telegram');

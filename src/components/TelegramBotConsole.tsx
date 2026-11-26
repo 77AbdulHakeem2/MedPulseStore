@@ -27,7 +27,7 @@ import {
 
 interface LiveTelegramStatus {
   configured: boolean;
-  tokenSource: 'database' | 'env' | 'none';
+  tokenSource: 'env' | 'none';
   tokenFingerprint: string | null;
   ownerTelegramIds: string;
   state: 'running' | 'starting' | 'stopped' | 'error' | 'not_configured';
@@ -178,10 +178,8 @@ export default function TelegramBotConsole({
   const [copiedBtnKey, setCopiedBtnKey] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
 
-  // Real Telegram Bot Live Connection State
+  // Real Telegram Bot Live Connection State (Token & Owner ID read-only from runtime env secrets)
   const [liveStatus, setLiveStatus] = useState<LiveTelegramStatus | null>(null);
-  const [botTokenInput, setBotTokenInput] = useState('');
-  const [ownerIdsInput, setOwnerIdsInput] = useState('');
   const [liveBusy, setLiveBusy] = useState(false);
   const [liveFeedback, setLiveFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [showTokenConfig, setShowTokenConfig] = useState(false);
@@ -190,7 +188,6 @@ export default function TelegramBotConsole({
     try {
       const res = await apiFetch<{ status: LiveTelegramStatus }>('/api/admin/telegram/status');
       setLiveStatus(res.status);
-      setOwnerIdsInput((prev) => (prev ? prev : res.status.ownerTelegramIds || ''));
     } catch {
       // Ignore if non-admin or initial load
     }
@@ -202,8 +199,7 @@ export default function TelegramBotConsole({
     return () => window.clearInterval(timer);
   }, []);
 
-  const handleConnectLiveBot = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleEnableLiveBot = async () => {
     setLiveBusy(true);
     setLiveFeedback(null);
     try {
@@ -211,19 +207,13 @@ export default function TelegramBotConsole({
         '/api/admin/telegram/config',
         {
           method: 'POST',
-          body: JSON.stringify({
-            botToken: botTokenInput.trim() || undefined,
-            ownerTelegramIds: ownerIdsInput.trim(),
-            enabled: true,
-          }),
+          body: JSON.stringify({ enabled: true }),
         }
       );
       setLiveStatus(res.status);
-      setBotTokenInput('');
       setLiveFeedback({ type: res.ok ? 'ok' : 'err', text: res.messageAr });
-      if (res.ok) setShowTokenConfig(false);
     } catch (err: any) {
-      setLiveFeedback({ type: 'err', text: err?.message || 'تعذر الاتصال ببوت تيليجرام.' });
+      setLiveFeedback({ type: 'err', text: err?.message || 'تعذر تشغيل بوت تيليجرام.' });
     } finally {
       setLiveBusy(false);
     }
@@ -477,7 +467,7 @@ export default function TelegramBotConsole({
               className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-semibold text-slate-700 hover:bg-slate-50 whitespace-nowrap"
             >
               <SlidersHorizontal className="h-3.5 w-3.5" />
-              {showConfigPanel ? 'إخفاء الإعدادات' : 'إعدادات التوكن'}
+              {showConfigPanel ? 'إخفاء حالة البيئة' : 'بيانات البيئة'}
             </button>
             {liveStatus?.configured && (
               <button
@@ -517,53 +507,50 @@ export default function TelegramBotConsole({
         )}
 
         {showConfigPanel && (
-          <form
-            onSubmit={handleConnectLiveBot}
-            className="grid grid-cols-1 gap-3 md:grid-cols-12 items-end border-t border-slate-100 bg-slate-50/50 px-5 py-4"
-          >
-            <div className="md:col-span-5">
-              <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-12 items-center border-t border-slate-100 bg-slate-50/60 px-5 py-4">
+            <div className="md:col-span-5 rounded-lg border border-slate-200/80 bg-white px-3.5 py-2.5">
+              <div className="flex items-center justify-between gap-2 text-[11px] font-semibold text-slate-600">
                 <span className="inline-flex items-center gap-1">
                   <KeyRound className="h-3 w-3 text-slate-400" />
-                  توكن البوت (@BotFather)
+                  توكن البوت (TELEGRAM_BOT_TOKEN)
                 </span>
-              </label>
-              <input
-                type="password"
-                value={botTokenInput}
-                onChange={(e) => setBotTokenInput(e.target.value)}
-                placeholder={
-                  liveStatus?.tokenFingerprint
-                    ? `محفوظ (${liveStatus.tokenFingerprint})`
-                    : '7123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxx'
-                }
-                className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-mono-num placeholder:font-sans focus:border-slate-900 focus:outline-none"
-              />
+                <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-slate-500">
+                  <Lock className="h-2.5 w-2.5" />
+                  أسرار بيئة التشغيل
+                </span>
+              </div>
+              <div className="mt-1 font-mono-num text-xs font-semibold text-slate-900">
+                {liveStatus?.tokenFingerprint || 'غير مضبوط في أسرار بيئة التشغيل'}
+              </div>
             </div>
 
-            <div className="md:col-span-4">
-              <label className="block text-[11px] font-semibold text-slate-600 mb-1">
-                معرّف المالك (Telegram Owner ID)
-              </label>
-              <input
-                type="text"
-                value={ownerIdsInput}
-                onChange={(e) => setOwnerIdsInput(e.target.value)}
-                placeholder="مثال: 123456789"
-                className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-mono-num placeholder:font-sans focus:border-slate-900 focus:outline-none"
-              />
+            <div className="md:col-span-4 rounded-lg border border-slate-200/80 bg-white px-3.5 py-2.5">
+              <div className="flex items-center justify-between gap-2 text-[11px] font-semibold text-slate-600">
+                <span>معرّف المالك (TELEGRAM_OWNER_IDS)</span>
+                <span className="inline-flex items-center gap-1 text-[10px] font-semibold text-slate-500">
+                  <Lock className="h-2.5 w-2.5" />
+                  أسرار بيئة التشغيل
+                </span>
+              </div>
+              <div className="mt-1 font-mono-num text-xs font-semibold text-slate-900">
+                {liveStatus?.ownerTelegramIds || 'غير مضبوط في أسرار بيئة التشغيل'}
+              </div>
             </div>
 
-              <div className="md:col-span-3">
+            <div className="md:col-span-3 flex flex-col gap-1.5">
               <button
-                type="submit"
-                disabled={liveBusy}
+                type="button"
+                disabled={liveBusy || !liveStatus?.configured}
+                onClick={() => void handleEnableLiveBot()}
                 className="w-full rounded-lg bg-emerald-700 px-4 py-2 text-xs font-semibold text-white hover:bg-emerald-800 disabled:opacity-50 whitespace-nowrap"
               >
-                {liveBusy ? 'جارٍ التشغيل...' : 'حفظ وتشغيل'}
+                {liveBusy ? 'جارٍ التشغيل...' : 'تشغيل البوت من البيئة'}
               </button>
+              <span className="text-[10px] text-slate-500 text-center">
+                لتغيير التوكن أو ID المالك عدّلهما في أسرار البيئة
+              </span>
             </div>
-          </form>
+          </div>
         )}
 
         {liveStatus?.customEmojiCapability && (

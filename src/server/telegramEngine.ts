@@ -58,12 +58,13 @@ import {
   getCustomerOrdersWithSanitizedDeliveries,
   registerOrderTelegramNotifier,
 } from './orderEngine.ts';
-import { decryptSecret, encryptSecret, generateUniqueRef, maskApiKey } from './crypto.ts';
+import { generateUniqueRef, maskApiKey } from './crypto.ts';
 import {
-  OFFICIAL_USDT_CONTRACTS,
+  getOfficialUsdtContract,
   fetchTrc20TransactionFromTronGrid,
   verifyUsdtDepositTransaction,
 } from './paymentVerifier.ts';
+import { getRuntimeVaultValue } from './runtimeSecretStore.ts';
 import {
   attemptBinanceDepositAutoVerification,
   resolveBinanceCredentials,
@@ -155,8 +156,16 @@ async function getStoreSettings(): Promise<StoreProfileSettings> {
     termsAr: raw.termsAr || 'جميع المبيعات رقمية وتُسلم تلقائيًا.',
     termsEn: raw.termsEn || 'All products are digital and delivered automatically upon confirmation.',
     isStoreOpen: raw.isStoreOpen !== false,
-    usdtTrc20Wallet: raw.usdtTrc20Wallet || 'TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7',
-    usdtBep20Wallet: raw.usdtBep20Wallet || '0x71C7656EC7ab88b098defB751B7401B5f6d8976F',
+    usdtTrc20Wallet:
+      getRuntimeVaultValue('usdtReceiverWalletTrc20') ||
+      raw.usdtTrc20Wallet ||
+      process.env.USDT_RECEIVER_WALLET_TRC20 ||
+      'TLa2f6VPqDgRE67v1736s7bJ8Ray5wYjU7',
+    usdtBep20Wallet:
+      getRuntimeVaultValue('usdtReceiverWalletBep20') ||
+      raw.usdtBep20Wallet ||
+      process.env.USDT_RECEIVER_WALLET_BEP20 ||
+      '0x71C7656EC7ab88b098defB751B7401B5f6d8976F',
     binancePayEnabled: raw.binancePayEnabled !== false,
     arEnabled: raw.arEnabled !== false,
     enEnabled: raw.enEnabled !== false,
@@ -212,21 +221,7 @@ async function getConfiguredOwnerTelegramIds(): Promise<string[]> {
     .map((s) => s.trim())
     .filter(Boolean);
 
-  try {
-    const [cfgRow] = await db
-      .select()
-      .from(settings)
-      .where(eq(settings.key, 'telegram_bot_config'))
-      .limit(1);
-    const cfg = (cfgRow?.valueJson as Record<string, any>) || {};
-    const fromDb = String(cfg.ownerTelegramIds || '')
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    return Array.from(new Set([...fromEnv, ...fromDb]));
-  } catch {
-    return Array.from(new Set(fromEnv));
-  }
+  return Array.from(new Set(fromEnv));
 }
 
 export async function getOrCreateTelegramUserWithMeta(params: {
@@ -492,7 +487,7 @@ async function createDepositAndRenderInstructions(params: {
   ) {
     const network = params.methodCode === 'usdt_bep20' ? 'BEP20' : 'TRC20';
     const recipient = network === 'BEP20' ? params.store.usdtBep20Wallet : params.store.usdtTrc20Wallet;
-    const contract = OFFICIAL_USDT_CONTRACTS[network];
+    const contract = getOfficialUsdtContract(network);
 
     const [createdDep] = await db
       .insert(deposits)
@@ -2430,7 +2425,9 @@ export async function handleTelegramInteraction(params: {
         depositId: dep.id,
         depositRef: dep.depositRef,
         expectedNetwork: dep.network === 'BEP20' ? 'BEP20' : 'TRC20',
-        expectedContract: dep.contractAddress || OFFICIAL_USDT_CONTRACTS.TRC20,
+        expectedContract:
+          dep.contractAddress ||
+          getOfficialUsdtContract(dep.network === 'BEP20' ? 'BEP20' : 'TRC20'),
         assignedRecipientAddress: dep.assignedRecipientAddress || store.usdtTrc20Wallet,
         expectedAmount: dep.expectedAmount,
         requiredConfirmations: dep.requiredConfirmations,
@@ -2725,7 +2722,7 @@ function buildTelegramInlineMarkup(
 
 async function resolveTelegramConfigFromDbAndEnv(): Promise<{
   token: string;
-  tokenSource: 'database' | 'env' | 'none';
+  tokenSource: 'env' | 'none';
   tokenFingerprint: string | null;
   ownerTelegramIds: string;
   enabled: boolean;
@@ -2742,39 +2739,16 @@ async function resolveTelegramConfigFromDbAndEnv(): Promise<{
     stored = {};
   }
 
-  const envOwnerIds = [process.env.TELEGRAM_OWNER_IDS || '', process.env.ADMIN_TELEGRAM_IDS || '']
-    .join(',')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .join(', ');
-
-  const ownerTelegramIds = (stored.ownerTelegramIds || envOwnerIds || '').trim();
-
-  if (stored.encryptedBotToken) {
-    try {
-      const decrypted = decryptSecret(stored.encryptedBotToken).trim();
-      if (decrypted) {
-        return {
-          token: decrypted,
-          tokenSource: 'database',
-          tokenFingerprint: stored.tokenFingerprint || maskApiKey(decrypted),
-          ownerTelegramIds,
-          enabled: stored.enabled !== false,
-        };
-      }
-    } catch {
-      // Fall through to env token
-    }
-  }
-
+  // Strictly read Owner IDs & Bot Token ONLY from runtime environment secrets
+  const envOwnerIds = (await getConfiguredOwnerTelegramIds()).join(', ');
   const envToken = (process.env.TELEGRAM_BOT_TOKEN || '').trim();
+
   if (envToken) {
     return {
       token: envToken,
       tokenSource: 'env',
       tokenFingerprint: maskApiKey(envToken),
-      ownerTelegramIds,
+      ownerTelegramIds: envOwnerIds,
       enabled: stored.enabled !== false,
     };
   }
@@ -2783,7 +2757,7 @@ async function resolveTelegramConfigFromDbAndEnv(): Promise<{
     token: '',
     tokenSource: 'none',
     tokenFingerprint: null,
-    ownerTelegramIds,
+    ownerTelegramIds: envOwnerIds,
     enabled: false,
   };
 }
@@ -3165,8 +3139,6 @@ export async function startOrRestartTelegramBot(): Promise<{
 }
 
 export async function saveTelegramBotConfig(params: {
-  botToken?: string;
-  ownerTelegramIds?: string;
   enabled?: boolean;
 }): Promise<{ ok: boolean; messageAr: string; status: TelegramBotRuntimeStatus }> {
   const [existingRow] = await db
@@ -3176,25 +3148,9 @@ export async function saveTelegramBotConfig(params: {
     .limit(1);
 
   const prev = (existingRow?.valueJson as StoredTelegramConfig) || {};
-  const next: StoredTelegramConfig = { ...prev };
-
-  const cleanedToken = typeof params.botToken === 'string' ? params.botToken.trim() : '';
-  if (cleanedToken) {
-    next.encryptedBotToken = encryptSecret(cleanedToken);
-    next.tokenFingerprint = maskApiKey(cleanedToken);
-  }
-  if (typeof params.ownerTelegramIds === 'string') {
-    next.ownerTelegramIds = params.ownerTelegramIds
-      .split(',')
-      .map((s) => s.trim())
-      .filter(Boolean)
-      .join(', ');
-  }
-  if (typeof params.enabled === 'boolean') {
-    next.enabled = params.enabled;
-  } else {
-    next.enabled = true;
-  }
+  const next: StoredTelegramConfig = {
+    enabled: typeof params.enabled === 'boolean' ? params.enabled : prev.enabled ?? true,
+  };
 
   await db
     .insert(settings)

@@ -370,7 +370,7 @@ export default function ModeratorsAccessView() {
               <div className="text-[11px] text-slate-500">
                 {posture.persistentSessionSecretConfigured
                   ? 'تبقى جلسات الموظفين صالحة بعد النشر'
-                  : 'يُنصح بإضافة SESSION_SIGNING_SECRET في البيئة'}
+                  : 'يمكنك توليده من «الإعدادات ← خزينة الأسرار»'}
               </div>
             </div>
 

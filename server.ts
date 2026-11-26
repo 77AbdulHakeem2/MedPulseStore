@@ -62,7 +62,6 @@ import {
   verifyPasswordScrypt,
 } from './src/server/rbacEngine.ts';
 import {
-  evaluateSyncPriceUpdate,
   formatMoney,
   resolveProductEffectivePricingAndStock,
   type ProviderOfferCandidate,
@@ -135,10 +134,21 @@ import {
   parseAuthHeaderInput,
 } from './src/lib/offerClassifier.ts';
 import {
-  collectDisappearedProviderOfferIds,
   getCustomerOrdersWithSanitizedDeliveries,
   placeCustomerOrder,
 } from './src/server/orderEngine.ts';
+import {
+  syncAllProvidersCatalog,
+  syncSingleProviderCatalog,
+} from './src/server/providerSyncEngine.ts';
+import { getRuntimeVaultValue } from './src/server/runtimeSecretStore.ts';
+import {
+  deleteVaultSecret,
+  generateVaultSecret,
+  getSecretsVaultSummary,
+  hydrateSecretsVault,
+  updateSecretsVault,
+} from './src/server/secretsVault.ts';
 import {
   bootstrapTelegramBotOnStartup,
   getActiveTelegramBotToken,
@@ -272,6 +282,7 @@ function clearAuthFailures(req: Request, identifier = '') {
 async function bootstrapMiddleware(_req: Request, res: Response, next: NextFunction) {
   try {
     await ensureSeededDatabase();
+    await hydrateSecretsVault();
     return next();
   } catch (err) {
     console.error('Database bootstrap failed:', err);
@@ -310,7 +321,9 @@ async function buildApp() {
         .select({ id: users.id, passwordHash: users.passwordHash })
         .from(users)
         .where(eq(users.role, 'owner'));
-      const passcodeEnvConfigured = Boolean((process.env.ADMIN_PASSCODE || '').trim());
+      const passcodeEnvConfigured = Boolean(
+        (process.env.ADMIN_PASSCODE || '').trim() || getRuntimeVaultValue('adminPasscode')
+      );
       const hasOwnerPasswordHash = owners.some((o) => Boolean((o.passwordHash || '').trim()));
       return res.json({
         ownerPasswordConfigured: passcodeEnvConfigured || hasOwnerPasswordHash,
@@ -326,10 +339,11 @@ async function buildApp() {
     try {
       if (checkAuthBruteForce(req, res, 'owner-setup')) return;
 
-      const passcodeEnv = (process.env.ADMIN_PASSCODE || '').trim();
+      const passcodeEnv =
+        (process.env.ADMIN_PASSCODE || '').trim() || getRuntimeVaultValue('adminPasscode');
       if (passcodeEnv) {
         return res.status(403).json({
-          error: 'تم تأمين الدخول عبر متغير البيئة ADMIN_PASSCODE. استخدمه لتسجيل الدخول.',
+          error: 'تم تأمين الدخول عبر رمز الدخول السريع للمالك (ADMIN_PASSCODE). استخدمه لتسجيل الدخول.',
         });
       }
 
@@ -459,8 +473,11 @@ async function buildApp() {
           matches[0];
       }
 
-      const envPasscode = (process.env.ADMIN_PASSCODE || '').trim();
-      const envOwnerEmail = normalizeEmail(process.env.OWNER_EMAIL);
+      const envPasscode =
+        (process.env.ADMIN_PASSCODE || '').trim() || getRuntimeVaultValue('adminPasscode');
+      const envOwnerEmail = normalizeEmail(
+        getRuntimeVaultValue('ownerEmail') || process.env.OWNER_EMAIL
+      );
       const isPasscodeMatch =
         Boolean(envPasscode) &&
         timingSafeSecretCompare(password, envPasscode) &&
@@ -945,7 +962,8 @@ async function buildApp() {
   // 3. TELEGRAM BOT ROUTES (Live Simulator + Real Webhook Endpoint)
   // ==========================================================================
   app.post('/api/telegram/webhook', async (req: Request, res: Response) => {
-    const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
+    const secret =
+      getRuntimeVaultValue('telegramWebhookSecret') || process.env.TELEGRAM_WEBHOOK_SECRET;
     if (secret && req.headers['x-telegram-bot-api-secret-token'] !== secret) {
       return res.status(401).json({ error: 'Invalid webhook secret' });
     }
@@ -962,7 +980,7 @@ async function buildApp() {
     }
   });
 
-  // --- Live Telegram Bot Connection Control (Long Polling + Encrypted Token in PostgreSQL) ---
+  // --- Live Telegram Bot Connection Control (Token & Owner ID strictly from Runtime Env Secrets) ---
   app.get('/api/admin/telegram/status', ...requirePermission('telegram:manage'), async (_req: AuthRequest, res: Response) => {
     try {
       const status = await getTelegramBotRuntimeStatus();
@@ -974,9 +992,17 @@ async function buildApp() {
 
   app.post('/api/admin/telegram/config', ...requirePermission('telegram:manage'), async (req: AuthRequest, res: Response) => {
     try {
+      const attemptedToken = typeof req.body?.botToken === 'string' && req.body.botToken.trim();
+      const attemptedOwnerIds =
+        typeof req.body?.ownerTelegramIds === 'string' && req.body.ownerTelegramIds.trim();
+      if (attemptedToken || attemptedOwnerIds) {
+        return res.status(400).json({
+          error:
+            'توكن البوت (TELEGRAM_BOT_TOKEN) ومعرّف المالك (TELEGRAM_OWNER_IDS) مقفولان للضبط عبر أسرار بيئة التشغيل فقط ولا يُدخلا من صفحة المعاينة.',
+        });
+      }
+
       const result = await saveTelegramBotConfig({
-        botToken: typeof req.body?.botToken === 'string' ? req.body.botToken : undefined,
-        ownerTelegramIds: typeof req.body?.ownerTelegramIds === 'string' ? req.body.ownerTelegramIds : undefined,
         enabled: typeof req.body?.enabled === 'boolean' ? req.body.enabled : true,
       });
 
@@ -1134,7 +1160,8 @@ async function buildApp() {
       const timestamp = String(req.headers['binancepay-timestamp'] || '');
       const nonce = String(req.headers['binancepay-nonce'] || '');
       const sig = String(req.headers['binancepay-signature'] || '');
-      const secret = process.env.BINANCE_PAY_SECRET_KEY || '';
+      const secret =
+        getRuntimeVaultValue('binancePaySecretKey') || process.env.BINANCE_PAY_SECRET_KEY || '';
 
       const ok = verifyBinancePayWebhook({
         timestamp,
@@ -1259,6 +1286,7 @@ async function buildApp() {
       const result = provs.map((p) => {
         const cred = creds.find((c) => c.providerId === p.id);
         const myProds = provProds.filter((pp) => pp.providerId === p.id);
+        const myInStockProds = myProds.filter((pp) => pp.stockCount > 0 && pp.isActiveAtProvider);
         const myProdIds = new Set(myProds.map((pp) => pp.id));
         const myMappings = mappings.filter((m) => myProdIds.has(m.providerProductId));
         const publishedCount = myMappings.filter((m) => m.isVisible).length;
@@ -1272,6 +1300,7 @@ async function buildApp() {
           hasApiKey: Boolean(cred),
           keyFingerprint: cred?.keyFingerprint || null, // NEVER return raw API key!
           productsCount: myProds.length,
+          inStockProductsCount: myInStockProds.length,
           publishedCount,
           hiddenCount,
           ordersCount,
@@ -1654,10 +1683,13 @@ async function buildApp() {
 
       const statusParam =
         req.query.status === 'imported' || req.query.status === 'not_imported' ? req.query.status : 'all';
+      const stockParam =
+        req.query.stock === 'all' || req.query.stock === 'out_of_stock' ? req.query.stock : 'in_stock';
       const paged = filterAndPaginateSupplierBrowserItems(browserItems, {
         search: typeof req.query.search === 'string' ? req.query.search : '',
         category: typeof req.query.category === 'string' ? req.query.category : 'all',
         status: statusParam,
+        stock: stockParam,
         page: Number(req.query.page || 1),
         pageSize: Number(req.query.pageSize || 24),
       });
@@ -1676,6 +1708,8 @@ async function buildApp() {
         },
         items: paged.items,
         totalCatalogCount: browserItems.length,
+        inStockCatalogCount: paged.inStockCatalogCount,
+        outOfStockCatalogCount: paged.outOfStockCatalogCount,
         importedCount,
         notImportedCount: browserItems.length - importedCount,
         totalMatched: paged.totalMatched,
@@ -2053,312 +2087,63 @@ async function buildApp() {
   });
 
   /**
+   * "تحديث جميع المنتجات من جميع الخوادم"
+   * Synchronizes stock, availability & wholesale prices from ALL enabled servers concurrently.
+   * Preserves every store product's categoryId, sortOrder, visibility, and manual pricing so
+   * restocked items automatically return to their exact prior category and sorted position.
+   */
+  app.post('/api/admin/providers/sync-all', ...requireAnyPermission(['providers:manage', 'products:manage']), async (req: AuthRequest, res: Response) => {
+    try {
+      const result = await syncAllProvidersCatalog({
+        actorUserId: req.user!.id,
+        actorRole: req.user!.role,
+        writeAuditLog: true,
+        onInvalidateCache: (pid) => supplierCatalogBrowserCache.delete(pid),
+      });
+      return res.json(result);
+    } catch (err: any) {
+      console.error('sync-all providers error:', err);
+      return res.status(500).json({ error: `تعذر تحديث المنتجات من الخوادم: ${err?.message || 'خطأ غير معروف'}` });
+    }
+  });
+
+  /**
    * "جلب المنتجات من الخادم"
    * - Fetches real catalog from live provider API if encrypted key is configured,
    *   otherwise simulates a realistic upstream sync showing newly discovered hidden items!
    * - CRITICAL RULES ENFORCED:
    *   1. Every newly imported store product starts with `isVisible: false` (HIDDEN by default!).
-   *   2. Existing products NEVER lose their visibility state or manual retail price on re-sync!
+   *   2. Existing products NEVER lose their category, sortOrder, visibility state, or manual retail price on re-sync!
    *   3. If wholesale price rises, an admin alert notification is created automatically!
    */
   app.post('/api/admin/providers/:id/sync', ...requirePermission('providers:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const providerId = Number(req.params.id);
-      const [prov] = await db.select().from(providers).where(eq(providers.id, providerId)).limit(1);
+      if (!Number.isInteger(providerId) || providerId <= 0) {
+        return res.status(400).json({ error: 'معرف الخادم غير صالح.' });
+      }
+      const [prov] = await db.select({ id: providers.id }).from(providers).where(eq(providers.id, providerId)).limit(1);
       if (!prov) return res.status(404).json({ error: 'الخادم غير موجود.' });
 
-      const [cred] = await db
-        .select()
-        .from(providerCredentials)
-        .where(eq(providerCredentials.providerId, providerId))
-        .limit(1);
-
-      const adapter = resolveProviderAdapter({
-        code: prov.code,
-        name: prov.name,
-        baseUrl: prov.baseUrl,
-        docsUrl: prov.docsUrl,
-        authType: prov.authType,
-        authHeader: prov.authHeader,
-        rateLimitPerMin: prov.rateLimitPerMin,
-      });
-      let importedItems: Array<{
-        externalProductId: string;
-        externalVariantId: string;
-        rawName: string;
-        rawDescription: string;
-        wholesalePrice: string;
-        stockCount: number;
-        minQty?: number;
-        maxQty?: number;
-        deliveryType: string;
-        durationLabel: string;
-        warrantyDays: number;
-        pricingTiers?: Array<{ minQty: number; maxQty: number | null; price: string }>;
-      }> = [];
-
-      let mode: 'live' | 'sandbox' = 'sandbox';
-      if (cred) {
-        mode = 'live';
-        const rawKey = decryptSecret(cred.encryptedApiKey);
-        importedItems = await adapter.fetchProducts(rawKey);
-      } else {
-        // Safe deterministic sync catalog reflecting verified provider offerings (zero real API key needed)
-        const existingProvProds = await db
-          .select()
-          .from(providerProducts)
-          .where(eq(providerProducts.providerId, providerId));
-        importedItems = existingProvProds.map((ep) => ({
-          externalProductId: ep.externalProductId,
-          externalVariantId: ep.externalVariantId,
-          rawName: ep.rawName,
-          rawDescription: ep.rawDescription || '',
-          wholesalePrice: ep.wholesalePrice,
-          stockCount: Math.max(10, ep.stockCount),
-          deliveryType: ep.deliveryType,
-          durationLabel: ep.durationLabel || '',
-          warrantyDays: ep.warrantyDays,
-        }));
-        // Also discover one new hidden product from this server if not already imported
-        const discoverySlug = `${prov.code}_canva_pro_12m`;
-        if (!importedItems.some((it) => it.externalProductId === discoverySlug)) {
-          importedItems.push({
-            externalProductId: discoverySlug,
-            externalVariantId: '',
-            rawName: `Canva Pro Education — 12M (${prov.name})`,
-            rawDescription: '',
-            wholesalePrice: '0.8500',
-            stockCount: 160,
-            deliveryType: 'link',
-            durationLabel: '12 شهر',
-            warrantyDays: 365,
-          });
-        }
-      }
-
-      registerDynamicSupplierIdentities([prov]);
-
-      const allCats = await db.select().from(categories).orderBy(asc(categories.sortOrder), asc(categories.id));
-
-      let newlyCreatedHidden = 0;
-      let updatedCount = 0;
-      let priceHikeAlerts = 0;
-
-      for (const item of importedItems) {
-        const rawTrimmed = (item.rawDescription || '').trim();
-        const processedSync = processSupplierProductDescription(rawTrimmed, {
-          extraSupplierNames: [prov.name, prov.code],
-        });
-        const cleanedSupplierDesc =
-          processedSync.telegramHtml || (rawTrimmed ? normalizeOriginalTelegramHtmlForPreview(rawTrimmed) : '');
-        const existing = await db
-          .select()
-          .from(providerProducts)
-          .where(
-            and(
-              eq(providerProducts.providerId, providerId),
-              eq(providerProducts.externalProductId, item.externalProductId),
-              eq(providerProducts.externalVariantId, item.externalVariantId || '')
-            )
-          )
-          .limit(1);
-
-        if (existing.length > 0) {
-          const prev = existing[0];
-          const oldW = prev.wholesalePrice;
-          const prevCleanedDesc = sanitizeCustomerProductDescription(prev.rawDescription);
-          await db
-            .update(providerProducts)
-            .set({
-              rawName: item.rawName,
-              // NEVER overwrite an existing stored description with empty when upstream list omits it!
-              rawDescription: cleanedSupplierDesc || prev.rawDescription || '',
-              previousWholesalePrice: oldW,
-              wholesalePrice: new Decimal(item.wholesalePrice).toFixed(4),
-              stockCount: item.stockCount,
-              isActiveAtProvider: true,
-              minQty: item.minQty || prev.minQty,
-              maxQty: item.maxQty || prev.maxQty,
-              durationLabel: item.durationLabel || prev.durationLabel,
-              pricingTiersJson: item.pricingTiers ?? prev.pricingTiersJson,
-              lastSyncedAt: new Date(),
-            })
-            .where(eq(providerProducts.id, prev.id));
-          updatedCount += 1;
-
-          // Check linked store products for wholesale price increase (NEVER overwrite manual price!)
-          const linked = await db
-            .select({ sp: storeProducts, pr: productPrices })
-            .from(productProviderMappings)
-            .innerJoin(storeProducts, eq(productProviderMappings.storeProductId, storeProducts.id))
-            .innerJoin(productPrices, eq(productPrices.storeProductId, storeProducts.id))
-            .where(eq(productProviderMappings.providerProductId, prev.id));
-
-          for (const l of linked) {
-            // Propagate updated supplier description ONLY if store product has empty description
-            // or still mirrors the supplier's previous description (never overwrite custom owner edits!)
-            const spDescAr = (l.sp.descriptionAr || '').trim();
-            const spDescEn = (l.sp.descriptionEn || '').trim();
-            const mirrorsPrevSupplierDesc =
-              !spDescAr ||
-              spDescAr === (prev.rawDescription || '').trim() ||
-              spDescAr === prevCleanedDesc;
-            if (cleanedSupplierDesc && mirrorsPrevSupplierDesc && spDescAr !== cleanedSupplierDesc) {
-              await db
-                .update(storeProducts)
-                .set({
-                  descriptionAr: cleanedSupplierDesc,
-                  descriptionEn:
-                    !spDescEn || spDescEn === spDescAr || spDescEn === prevCleanedDesc
-                      ? cleanedSupplierDesc
-                      : l.sp.descriptionEn,
-                  updatedAt: new Date(),
-                })
-                .where(eq(storeProducts.id, l.sp.id));
-            }
-
-            const evalRes = evaluateSyncPriceUpdate({
-              oldWholesale: oldW,
-              newWholesale: item.wholesalePrice,
-              rule: {
-                pricingMode: l.pr.pricingMode as any,
-                retailPrice: l.pr.retailPrice,
-                fixedMargin: l.pr.fixedMargin,
-                percentMargin: l.pr.percentMargin,
-                paymentFeePercent: l.pr.paymentFeePercent,
-                extraFixedCost: l.pr.extraFixedCost,
-                lockManualPrice: l.pr.lockManualPrice,
-              },
-            });
-            if (evalRes.wholesaleIncreased) {
-              priceHikeAlerts += 1;
-              await db.insert(notifications).values({
-                audience: 'admin',
-                eventType: 'wholesale_price_increase',
-                severity: 'warning',
-                titleAr: `تنبيه ارتفاع سعر الجملة: ${l.sp.titleAr}`,
-                bodyAr: `ارتفع سعر الجملة من $${formatMoney(oldW, 2)} إلى $${formatMoney(item.wholesalePrice, 2)} (+$${formatMoney(evalRes.delta, 2)}). سعر البيع الحالي: $${formatMoney(evalRes.preservedRetailPrice, 2)}.`,
-              });
-            }
-            if (l.pr.pricingMode !== 'manual') {
-              await syncStoredEffectiveRetailPrice(l.sp.id);
-            }
-          }
-        } else {
-          // Insert new raw provider offer into provider_products pool (with cleaned Telegram HTML & zero supplier branding)
-          const [newPP] = await db
-            .insert(providerProducts)
-            .values({
-              providerId,
-              externalProductId: item.externalProductId,
-              externalVariantId: item.externalVariantId || '',
-              rawName: item.rawName,
-              rawDescription: cleanedSupplierDesc,
-              wholesalePrice: new Decimal(item.wholesalePrice).toFixed(4),
-              currency: 'USD',
-              stockCount: item.stockCount,
-              deliveryType: item.deliveryType,
-              durationLabel: item.durationLabel,
-              warrantyDays: item.warrantyDays,
-            })
-            .returning();
-
-          // Keep store catalog clean and server-independent by default!
-          // Only create a standalone hidden store_product if explicitly requested via autoCreateStoreProducts: true
-          if (req.body?.autoCreateStoreProducts === true) {
-            const cleanTitle = item.rawName.replace(/\(.*?\)/g, '').trim();
-            const matchedCat = matchProductToStoreCategory(cleanTitle, cleanedSupplierDesc || '', allCats);
-            const sku = generateUniqueRef('SKU').slice(0, 16);
-            const safeCustomerDesc = cleanedSupplierDesc;
-            const [newSP] = await db
-              .insert(storeProducts)
-              .values({
-                sku,
-                categoryId: matchedCat?.categoryId ?? null,
-                titleAr: cleanTitle,
-                titleEn: cleanTitle,
-                descriptionAr: safeCustomerDesc,
-                descriptionEn: safeCustomerDesc,
-                warrantyLabelAr: item.warrantyDays > 0 ? `ضمان ${item.warrantyDays} يومًا` : 'ضمان التشغيل الفوري',
-                warrantyLabelEn: item.warrantyDays > 0 ? `${item.warrantyDays}-day warranty` : 'Instant Activation Warranty',
-                warrantyDays: item.warrantyDays,
-                durationLabel: item.durationLabel || 'حسب الباقة',
-                deliveryType: item.deliveryType,
-                isVisible: false, // STRICT REQUIREMENT: Hidden by default!
-                isPaused: false,
-              })
-              .returning();
-
-            await db.insert(productProviderMappings).values({
-              storeProductId: newSP.id,
-              providerProductId: newPP.id,
-              roleType: 'primary',
-              priority: 1,
-              isVerifiedCompatible: true,
-            });
-
-            const suggestedRetail = new Decimal(item.wholesalePrice).plus('2.00').toFixed(4);
-            await db.insert(productPrices).values({
-              storeProductId: newSP.id,
-              pricingMode: 'manual',
-              retailPrice: suggestedRetail,
-              agentPrice: suggestedRetail,
-              fixedMargin: '2.0000',
-              percentMargin: '100.0000',
-              paymentFeePercent: '1.5000',
-              lockManualPrice: true,
-            });
-          }
-
-          newlyCreatedHidden += 1;
-        }
-      }
-
-      if (mode === 'live' && importedItems.length > 0 && !(importedItems as any).__partial) {
-        const allStoredForProv = await db
-          .select({
-            id: providerProducts.id,
-            externalProductId: providerProducts.externalProductId,
-            externalVariantId: providerProducts.externalVariantId,
-            stockCount: providerProducts.stockCount,
-            isActiveAtProvider: providerProducts.isActiveAtProvider,
-          })
-          .from(providerProducts)
-          .where(eq(providerProducts.providerId, providerId));
-        const disappearedIds = collectDisappearedProviderOfferIds(
-          allStoredForProv,
-          importedItems,
-          Boolean((importedItems as any).__partial)
-        );
-        if (disappearedIds.length > 0) {
-          await db
-            .update(providerProducts)
-            .set({ stockCount: 0, isActiveAtProvider: false, lastSyncedAt: new Date() })
-            .where(inArray(providerProducts.id, disappearedIds));
-        }
-      }
-
-      await db
-        .update(providers)
-        .set({ lastSyncAt: new Date(), updatedAt: new Date() })
-        .where(eq(providers.id, providerId));
-
-      await db.insert(auditLogs).values({
+      const result = await syncSingleProviderCatalog({
+        providerId,
+        allowSandboxFallback: true,
+        autoCreateStoreProducts: req.body?.autoCreateStoreProducts === true,
         actorUserId: req.user!.id,
         actorRole: req.user!.role,
-        action: 'PROVIDER_PRODUCTS_SYNCED',
-        entityType: 'provider',
-        entityId: String(providerId),
-        detailsJson: { mode, newlyCreatedHidden, updatedCount, priceHikeAlerts },
+        writeAuditLog: true,
+        onInvalidateCache: (pid) => supplierCatalogBrowserCache.delete(pid),
       });
 
       return res.json({
         ok: true,
-        mode,
-        newlyCreatedHidden,
-        updatedCount,
-        priceHikeAlerts,
-        messageAr: `تمت المزامنة مع ${prov.name}: ${newlyCreatedHidden} عرض جديد أُضيف لخزنة العروض، و${updatedCount} عرض تم تحديث مخزونه وأسعاره مع الحفاظ على كتالوج متجرك وأولوية المزودين.`,
+        mode: result.mode,
+        newlyCreatedHidden: result.newlyCreatedHidden,
+        updatedCount: result.updatedCount,
+        restockedOffersCount: result.restockedOffersCount,
+        depletedOffersCount: result.depletedOffersCount,
+        priceHikeAlerts: result.priceHikeAlerts,
+        messageAr: result.messageAr,
       });
     } catch (err: any) {
       console.error('provider sync error:', err);
@@ -2604,6 +2389,7 @@ async function buildApp() {
             rawDescription: x.pp.rawDescription || '',
             wholesalePrice: formatMoney(x.pp.wholesalePrice, 2),
             stockCount: x.pp.stockCount,
+            isActiveAtProvider: x.pp.isActiveAtProvider,
             durationLabel: x.pp.durationLabel,
             deliveryType: x.pp.deliveryType,
             warrantyDays: x.pp.warrantyDays,
@@ -3263,6 +3049,37 @@ async function buildApp() {
       return res.json({ ok: true, affected: ids.length, autoCategorizedOnShow });
     } catch (err) {
       return res.status(500).json({ error: 'تعذر تنفيذ التعديل الجماعي.' });
+    }
+  });
+
+  app.post('/api/admin/products/reorder', ...requirePermission('products:manage'), async (req: AuthRequest, res: Response) => {
+    try {
+      const items = Array.isArray(req.body?.items) ? req.body.items : [];
+      const sanitized = items
+        .map((item: any) => ({ id: Number(item?.id), sortOrder: Number(item?.sortOrder) }))
+        .filter((item: { id: number; sortOrder: number }) => Number.isInteger(item.id) && item.id > 0 && Number.isFinite(item.sortOrder));
+      if (sanitized.length === 0) {
+        return res.status(400).json({ error: 'يرجى تمرير قائمة صالحة لإعادة ترتيب المنتجات.' });
+      }
+      await db.transaction(async (tx) => {
+        for (const row of sanitized) {
+          await tx
+            .update(storeProducts)
+            .set({ sortOrder: Math.max(0, Math.round(row.sortOrder)), updatedAt: new Date() })
+            .where(eq(storeProducts.id, row.id));
+        }
+        await tx.insert(auditLogs).values({
+          actorUserId: req.user!.id,
+          actorRole: req.user!.role,
+          action: 'STORE_PRODUCTS_REORDERED',
+          entityType: 'store_product',
+          entityId: String(sanitized[0].id),
+          detailsJson: { count: sanitized.length, order: sanitized },
+        });
+      });
+      return res.json({ ok: true, updatedCount: sanitized.length });
+    } catch {
+      return res.status(500).json({ error: 'تعذر حفظ ترتيب المنتجات.' });
     }
   });
 
@@ -5839,8 +5656,10 @@ async function buildApp() {
     return res.json({
       storeProfile: map.store_profile || {},
       notificationPreferences: map.notification_preferences || {},
-      telegramConfigured: Boolean(process.env.TELEGRAM_BOT_TOKEN),
-      binancePayConfigured: Boolean(process.env.BINANCE_PAY_API_KEY),
+      telegramConfigured: Boolean((process.env.TELEGRAM_BOT_TOKEN || '').trim()),
+      binancePayConfigured: Boolean(
+        getRuntimeVaultValue('binancePayApiKey') || process.env.BINANCE_PAY_API_KEY
+      ),
     });
   });
 
@@ -6224,8 +6043,12 @@ async function buildApp() {
         rolePresets: DEFAULT_ROLE_PERMISSION_PRESETS,
         hostingPosture: {
           persistentSessionSecretConfigured: isPersistentSessionSecretConfigured(),
-          passcodeEnvConfigured: Boolean((process.env.ADMIN_PASSCODE || '').trim()),
-          ownerEmailEnvConfigured: Boolean((process.env.OWNER_EMAIL || '').trim()),
+          passcodeEnvConfigured: Boolean(
+            (process.env.ADMIN_PASSCODE || '').trim() || getRuntimeVaultValue('adminPasscode')
+          ),
+          ownerEmailEnvConfigured: Boolean(
+            getRuntimeVaultValue('ownerEmail') || (process.env.OWNER_EMAIL || '').trim()
+          ),
           telegramBotRunning: telegramStatus?.state === 'running',
           databaseEngine: 'PostgreSQL',
         },
@@ -6592,6 +6415,111 @@ async function buildApp() {
     }
   });
 
+  // ==========================================================================
+  // OWNER-ONLY PREVIEW SECRETS VAULT (All Secrets Except TELEGRAM_BOT_TOKEN & TELEGRAM_OWNER_IDS)
+  // ==========================================================================
+  app.get('/api/admin/secrets-vault', ...requireOwner, async (_req: AuthRequest, res: Response) => {
+    try {
+      const vault = await getSecretsVaultSummary();
+      return res.json({ vault });
+    } catch (err: any) {
+      return res.status(500).json({ error: err?.message || 'تعذر تحميل خزينة الأسرار.' });
+    }
+  });
+
+  app.patch('/api/admin/secrets-vault', ...requireOwner, async (req: AuthRequest, res: Response) => {
+    try {
+      const updates =
+        req.body?.updates && typeof req.body.updates === 'object' ? req.body.updates : req.body;
+      const result = await updateSecretsVault({
+        updates: updates || {},
+        actorUserId: req.user!.id,
+        actorRole: req.user!.role,
+      });
+
+      const refreshedToken = result.sessionSecretChanged
+        ? signSessionToken({
+            uid: req.user!.uid,
+            userId: req.user!.id,
+            email: req.user!.email || '',
+            role: req.user!.role as any,
+            displayName: req.user!.displayName,
+            tv: req.user!.tokenVersion,
+          })
+        : undefined;
+
+      return res.json({
+        ok: true,
+        vault: result.summary,
+        updatedKeys: result.updatedKeys,
+        refreshedToken,
+      });
+    } catch (err: any) {
+      return res.status(400).json({ error: err?.message || 'تعذر حفظ مفاتيح خزينة الأسرار.' });
+    }
+  });
+
+  app.post('/api/admin/secrets-vault/generate', ...requireOwner, async (req: AuthRequest, res: Response) => {
+    try {
+      const key = String(req.body?.key || '').trim() as any;
+      const result = await generateVaultSecret({
+        key,
+        actorUserId: req.user!.id,
+        actorRole: req.user!.role,
+      });
+
+      const refreshedToken = result.sessionSecretChanged
+        ? signSessionToken({
+            uid: req.user!.uid,
+            userId: req.user!.id,
+            email: req.user!.email || '',
+            role: req.user!.role as any,
+            displayName: req.user!.displayName,
+            tv: req.user!.tokenVersion,
+          })
+        : undefined;
+
+      return res.json({
+        ok: true,
+        vault: result.summary,
+        fingerprint: result.fingerprint,
+        refreshedToken,
+      });
+    } catch (err: any) {
+      return res.status(400).json({ error: err?.message || 'تعذر توليد المفتاح العشوائي.' });
+    }
+  });
+
+  app.delete('/api/admin/secrets-vault/:key', ...requireOwner, async (req: AuthRequest, res: Response) => {
+    try {
+      const key = String(req.params.key || '').trim();
+      const result = await deleteVaultSecret({
+        key,
+        actorUserId: req.user!.id,
+        actorRole: req.user!.role,
+      });
+
+      const refreshedToken = result.sessionSecretChanged
+        ? signSessionToken({
+            uid: req.user!.uid,
+            userId: req.user!.id,
+            email: req.user!.email || '',
+            role: req.user!.role as any,
+            displayName: req.user!.displayName,
+            tv: req.user!.tokenVersion,
+          })
+        : undefined;
+
+      return res.json({
+        ok: true,
+        vault: result.summary,
+        refreshedToken,
+      });
+    } catch (err: any) {
+      return res.status(400).json({ error: err?.message || 'تعذر حذف المفتاح من خزينة الأسرار.' });
+    }
+  });
+
   // Live Security Isolation Audit Endpoint (verifies AR + EN customer isolation + Inline-Only + Auth Hardening!)
   app.post('/api/admin/security-check', ...requirePermission('audit:view'), async (_req: AuthRequest, res: Response) => {
     const [allProds, ownerAccounts] = await Promise.all([
@@ -6612,7 +6540,7 @@ async function buildApp() {
       containsProviderLeak(sanitizeErrorForCustomer('Pixora API HTTP 500 px_live_abc', 'ar')) ||
       containsProviderLeak(sanitizeErrorForCustomer('Binance sapi/v1 X-MBX-APIKEY error', 'en'));
     const ownerAuthConfigured =
-      Boolean((process.env.ADMIN_PASSCODE || '').trim()) ||
+      Boolean((process.env.ADMIN_PASSCODE || '').trim() || getRuntimeVaultValue('adminPasscode')) ||
       ownerAccounts.some((o) => Boolean((o.passwordHash || '').trim()));
 
     return res.json({
@@ -6656,114 +6584,10 @@ async function buildApp() {
     if (isProviderAutoSyncRunning) return;
     isProviderAutoSyncRunning = true;
     try {
-      const enabledProviders = await db
-        .select()
-        .from(providers)
-        .where(and(eq(providers.isEnabled, true), eq(providers.status, 'connected')));
-
-      for (const prov of enabledProviders) {
-        try {
-          const [cred] = await db
-            .select()
-            .from(providerCredentials)
-            .where(eq(providerCredentials.providerId, prov.id))
-            .limit(1);
-          if (!cred) continue;
-
-          const adapter = resolveProviderAdapter({
-            code: prov.code,
-            name: prov.name,
-            baseUrl: prov.baseUrl,
-            docsUrl: prov.docsUrl,
-            authType: prov.authType,
-            authHeader: prov.authHeader,
-            rateLimitPerMin: prov.rateLimitPerMin,
-          });
-          const rawKey = decryptSecret(cred.encryptedApiKey);
-
-          const [itemsResult, balanceResult] = await Promise.allSettled([
-            adapter.fetchProducts(rawKey),
-            adapter.testConnection(rawKey),
-          ]);
-
-          if (balanceResult.status === 'fulfilled' && balanceResult.value.connected) {
-            await db
-              .update(providers)
-              .set({
-                cachedBalance: new Decimal(balanceResult.value.balance || '0').toFixed(4),
-                updatedAt: new Date(),
-              })
-              .where(eq(providers.id, prov.id));
-          }
-
-          if (itemsResult.status === 'fulfilled' && Array.isArray(itemsResult.value)) {
-            for (const item of itemsResult.value) {
-              const existing = await db
-                .select()
-                .from(providerProducts)
-                .where(
-                  and(
-                    eq(providerProducts.providerId, prov.id),
-                    eq(providerProducts.externalProductId, item.externalProductId),
-                    eq(providerProducts.externalVariantId, item.externalVariantId || '')
-                  )
-                )
-                .limit(1);
-
-              if (existing.length > 0) {
-                const prev = existing[0];
-                const backfilledDesc =
-                  !(prev.rawDescription || '').trim() && (item.rawDescription || '').trim()
-                    ? sanitizeCustomerProductDescription(item.rawDescription) ||
-                      normalizeOriginalTelegramHtmlForPreview(item.rawDescription)
-                    : prev.rawDescription;
-                await db
-                  .update(providerProducts)
-                  .set({
-                    previousWholesalePrice: prev.wholesalePrice,
-                    wholesalePrice: new Decimal(item.wholesalePrice).toFixed(4),
-                    stockCount: item.stockCount,
-                    isActiveAtProvider: true,
-                    rawDescription: backfilledDesc || '',
-                    lastSyncedAt: new Date(),
-                  })
-                  .where(eq(providerProducts.id, prev.id));
-              }
-            }
-            if (itemsResult.value.length > 0 && !(itemsResult.value as any).__partial) {
-              const storedForProv = await db
-                .select({
-                  id: providerProducts.id,
-                  externalProductId: providerProducts.externalProductId,
-                  externalVariantId: providerProducts.externalVariantId,
-                  stockCount: providerProducts.stockCount,
-                  isActiveAtProvider: providerProducts.isActiveAtProvider,
-                })
-                .from(providerProducts)
-                .where(eq(providerProducts.providerId, prov.id));
-              const disappearedIds = collectDisappearedProviderOfferIds(
-                storedForProv,
-                itemsResult.value,
-                Boolean((itemsResult.value as any).__partial)
-              );
-              if (disappearedIds.length > 0) {
-                await db
-                  .update(providerProducts)
-                  .set({ stockCount: 0, isActiveAtProvider: false, lastSyncedAt: new Date() })
-                  .where(inArray(providerProducts.id, disappearedIds));
-              }
-            }
-            await db
-              .update(providers)
-              .set({ lastSyncAt: new Date(), updatedAt: new Date() })
-              .where(eq(providers.id, prov.id));
-          }
-        } catch {
-          // Isolate per-provider network errors so remaining servers continue syncing cleanly
-        }
-      }
-
-      await syncAllNonManualProductPrices();
+      await syncAllProvidersCatalog({
+        writeAuditLog: false,
+        onInvalidateCache: (pid) => supplierCatalogBrowserCache.delete(pid),
+      });
     } catch (err) {
       console.error('Background provider sync skipped:', err);
     } finally {
@@ -6773,6 +6597,7 @@ async function buildApp() {
 
   // Auto-start real Telegram Bot (Long Polling) & sync dynamic prices on server boot
   void ensureSeededDatabase()
+    .then(() => hydrateSecretsVault())
     .then(() => syncAllNonManualProductPrices())
     .then(() => bootstrapTelegramBotOnStartup())
     .catch((err) => console.error('Initial Telegram bot auto-start skipped:', err));
