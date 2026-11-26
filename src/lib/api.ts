@@ -4,7 +4,28 @@ export interface SessionUser {
   email: string | null;
   displayName: string;
   role: 'owner' | 'admin' | 'support' | 'customer';
+  permissions?: string[];
   telegramUserId?: string | null;
+}
+
+export function hasStaffPermission(
+  user: SessionUser | null | undefined,
+  permission: string
+): boolean {
+  if (!user) return false;
+  if (user.role === 'owner') return true;
+  if (user.role === 'customer') return false;
+  return Array.isArray(user.permissions) && user.permissions.includes(permission);
+}
+
+export function hasAnyStaffPermission(
+  user: SessionUser | null | undefined,
+  permissions: string[]
+): boolean {
+  if (!user) return false;
+  if (user.role === 'owner') return true;
+  if (user.role === 'customer') return false;
+  return permissions.some((p) => Array.isArray(user.permissions) && user.permissions.includes(p));
 }
 
 let activeToken: string | null = null;

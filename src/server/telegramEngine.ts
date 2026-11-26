@@ -20,6 +20,7 @@ import {
   serviceGuides,
   localDeposits,
 } from '../db/schema.ts';
+import { getEffectivePermissions, hasPermission } from './rbacEngine.ts';
 import {
   buildCustomerMainInlineKeyboard,
   buildCustomerNavFooter,
@@ -27,6 +28,7 @@ import {
   buildProductQuantityInlineKeyboard,
   buildPurchaseConfirmationInlineKeyboard,
   buildSupportTelegramUrl,
+  ensureWarningPrefix,
   formatCustomerOrderCard,
   formatCustomerProductButtonLabel,
   formatCustomerProfileCard,
@@ -775,15 +777,41 @@ export async function handleTelegramInteraction(params: {
   const storeDisplayName = getStoreDisplayName(store, lang);
   const isCallback = Boolean(params.callbackData);
 
-  const isPrivilegedAdmin =
-    (user.role === 'owner' || user.role === 'admin') && params.enforceRole !== 'customer';
+  const isStaffTelegramAllowed =
+    user.role === 'owner' ||
+    (!user.isBlocked &&
+      (user.role === 'admin' || user.role === 'support') &&
+      hasPermission(
+        { role: user.role, permissions: getEffectivePermissions(user.role, user.permissionsJson) },
+        'telegram:manage'
+      ));
+  const isPrivilegedAdmin = isStaffTelegramAllowed && params.enforceRole !== 'customer';
 
   const input = (params.callbackData || params.text || '/start').trim();
   const fsm: BotFsmState = (user.botStateJson as BotFsmState) || { step: 'idle' };
   const activeAdminFsmStep = fsm.adminFsm?.step && fsm.adminFsm.step !== 'idle' ? fsm.adminFsm.step : null;
 
   // ==========================================================================
-  // 1. STRICT RBAC GUARD FOR TELEGRAM ADMIN PANEL (/admin, adm:*, active adminFsm)
+  // 1a. BLOCKED USER ENFORCEMENT BEFORE ANY COMMAND (Admin Ban / Unban)
+  // ==========================================================================
+  if (user.isBlocked && user.role !== 'owner') {
+    return {
+      mode: 'customer',
+      lang,
+      editInPlace: isCallback,
+      accessDenied: true,
+      text:
+        lang === 'en'
+          ? '🚫 Your account is currently suspended by store administration.\nPlease contact support if you believe this is a mistake.'
+          : '🚫 تم حظر حسابك مؤقتًا من استخدام المتجر من قِبل الإدارة.\nللاستفسار أو رفع الحظر يرجى التواصل مع الدعم الفني.',
+      inlineKeyboard: [
+        [{ text: t(lang, 'btn_support'), url: buildSupportTelegramUrl(store.supportHandle), style: 'primary' }],
+      ],
+    };
+  }
+
+  // ==========================================================================
+  // 1b. STRICT RBAC GUARD FOR TELEGRAM ADMIN PANEL (/admin, adm:*, active adminFsm)
   // ==========================================================================
   const isExplicitAdminCommand =
     input === '/admin' ||
@@ -821,25 +849,6 @@ export async function handleTelegramInteraction(params: {
         await sendDirectTelegramNotification(tgId, txt);
       },
     });
-  }
-
-  // ==========================================================================
-  // 1b. BLOCKED USER ENFORCEMENT (Admin Ban / Unban)
-  // ==========================================================================
-  if (user.isBlocked && user.role !== 'owner') {
-    return {
-      mode: 'customer',
-      lang,
-      editInPlace: isCallback,
-      accessDenied: true,
-      text:
-        lang === 'en'
-          ? '🚫 Your account is currently suspended by store administration.\nPlease contact support if you believe this is a mistake.'
-          : '🚫 تم حظر حسابك مؤقتًا من استخدام المتجر من قِبل الإدارة.\nللاستفسار أو رفع الحظر يرجى التواصل مع الدعم الفني.',
-      inlineKeyboard: [
-        [{ text: t(lang, 'btn_support'), url: buildSupportTelegramUrl(store.supportHandle), style: 'primary' }],
-      ],
-    };
   }
 
   // ==========================================================================
@@ -923,8 +932,8 @@ export async function handleTelegramInteraction(params: {
         return renderCustomerHome(
           lang,
           lang === 'en'
-            ? `⚠️ ${liveCheck.errorMessageEn || 'Live YER exchange rate is temporarily unavailable. Keeping USD.'}`
-            : `⚠️ ${liveCheck.errorMessageAr || 'تعذر جلب سعر الصرف المباشر للريال اليمني حاليًا. تم الإبقاء على الدولار ($).'}`
+            ? ensureWarningPrefix(liveCheck.errorMessageEn || 'Live YER exchange rate is temporarily unavailable. Keeping USD.')
+            : ensureWarningPrefix(liveCheck.errorMessageAr || 'تعذر جلب سعر الصرف المباشر للريال اليمني حاليًا. تم الإبقاء على الدولار ($).')
         );
       }
       displayRate = liveCheck.rate;
@@ -1480,7 +1489,7 @@ export async function handleTelegramInteraction(params: {
       editInPlace: isCallback,
       text: result.ok
         ? result.deliveryMessageAr || t(lang, 'order_success_fallback', { orderNumber: result.orderNumber || '' })
-        : `⚠️ ${result.customerErrorAr}`,
+        : ensureWarningPrefix(result.customerErrorAr || t(lang, 'error_generic')),
       inlineKeyboard: postButtons,
     };
   }
@@ -2978,7 +2987,14 @@ function createConfiguredGrammyBot(token: string): Bot {
         displayName: [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ') || 'Admin',
         telegramLanguageCode: ctx.from.language_code,
       });
-      const isPrivilegedAdmin = user.role === 'owner' || user.role === 'admin';
+      const isPrivilegedAdmin =
+        user.role === 'owner' ||
+        (!user.isBlocked &&
+          (user.role === 'admin' || user.role === 'support') &&
+          hasPermission(
+            { role: user.role, permissions: getEffectivePermissions(user.role, user.permissionsJson) },
+            'deposits:approve'
+          ));
       const channelRes = await handleAdminChannelLocalDepositAction({
         adminUser: user,
         isPrivilegedAdmin,

@@ -430,7 +430,11 @@ export function sanitizeErrorForCustomer(rawError: unknown, lang: SupportedLang 
   if (/STORE_MAINTENANCE/i.test(msg)) {
     return t(lang, 'error_maintenance');
   }
-  if (/PRODUCT_UNAVAILABLE_CUSTOMER|OUT_OF_STOCK_CUSTOMER/i.test(msg)) {
+  if (
+    /PRODUCT_UNAVAILABLE_CUSTOMER|OUT_OF_STOCK_CUSTOMER|PRODUCT_NOT_FOUND|PRODUCT_UNAVAILABLE|OUT_OF_STOCK/i.test(
+      msg
+    )
+  ) {
     return t(lang, 'error_product_unavailable');
   }
   if (/UNAUTHORIZED_ORDER_ACCESS/i.test(msg)) {
@@ -438,6 +442,13 @@ export function sanitizeErrorForCustomer(rawError: unknown, lang: SupportedLang 
   }
 
   return t(lang, 'error_generic');
+}
+
+export function ensureWarningPrefix(message: string): string {
+  const trimmed = (message || '').trim();
+  if (!trimmed) return '⚠️';
+  const stripped = trimmed.replace(/^(?:⚠️\s*)+/, '').trim();
+  return `⚠️ ${stripped || trimmed}`;
 }
 
 export interface CustomerProductDTO {

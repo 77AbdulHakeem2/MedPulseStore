@@ -8,6 +8,8 @@ import {
   evaluateProviderPriorityQueue,
   resolveProductEffectivePricingAndStock,
   canSafelyFailoverToBackup,
+  classifyProviderAttemptFailureAction,
+  collectDisappearedProviderOfferIds,
   applyCouponDiscount,
   type ProviderOfferCandidate,
 } from './pricing.ts';
@@ -17,6 +19,7 @@ import {
   buildProductQuantityInlineKeyboard,
   buildPurchaseConfirmationInlineKeyboard,
   buildSupportTelegramUrl,
+  ensureWarningPrefix,
   formatCustomerOrderCard,
   formatCustomerProductButtonLabel,
   formatCustomerProfileCard,
@@ -125,6 +128,24 @@ import {
   buildTelegramChannelCandidates,
   evaluateTelegramChannelPermissions,
 } from './localDepositEngine.ts';
+import {
+  ADMIN_PERMISSION_DEFS,
+  DEFAULT_ROLE_PERMISSION_PRESETS,
+  canManageTargetModerator,
+  getEffectivePermissions,
+  hasAnyPermission,
+  hasPermission,
+  hashPasswordScrypt,
+  isStaffRole,
+  sanitizeModeratorPermissionsInput,
+  timingSafeSecretCompare,
+  validatePasswordStrength,
+  verifyPasswordScrypt,
+} from './rbacEngine.ts';
+import {
+  signSessionToken,
+  verifySessionToken,
+} from './crypto.ts';
 import {
   parseReferralStartPayload,
   buildTelegramReferralLink,
@@ -3818,9 +3839,178 @@ test('49. Supplier Product Browser filtering, duplicate protection, update seman
   assert.equal(updateDupPlan.finalDescriptionHtml, '<b>Official Adobe CC</b> access');
 });
 
+test('50. PRODUCT_NOT_FOUND auto-zeros stale offer, fails over safely, shows single-icon unavailable error, and reconciles sync', () => {
+  // 1. PRODUCT_NOT_FOUND triggers stock=0 + offer deactivation + admin missing-offer alert + safe backup failover
+  const notFoundAction = classifyProviderAttemptFailureAction('PRODUCT_NOT_FOUND');
+  assert.deepEqual(notFoundAction, {
+    zeroStock: true,
+    deactivateOffer: true,
+    notifyAdminMissingOffer: true,
+  });
+  assert.equal(
+    canSafelyFailoverToBackup({
+      status: 'failed',
+      uncertainState: false,
+      deterministicFailureCode: 'PRODUCT_NOT_FOUND',
+    }),
+    true
+  );
 
+  // 2. OUT_OF_STOCK zeros stock without permanently deactivating the offer
+  const outOfStockAction = classifyProviderAttemptFailureAction('OUT_OF_STOCK');
+  assert.deepEqual(outOfStockAction, {
+    zeroStock: true,
+    deactivateOffer: false,
+    notifyAdminMissingOffer: false,
+  });
 
+  // 3. Customer error sanitizer maps PRODUCT_NOT_FOUND / PRODUCT_UNAVAILABLE / OUT_OF_STOCK to clear product unavailable text
+  assert.equal(sanitizeErrorForCustomer('PRODUCT_NOT_FOUND', 'ar'), t('ar', 'error_product_unavailable'));
+  assert.equal(sanitizeErrorForCustomer('PRODUCT_NOT_FOUND', 'en'), t('en', 'error_product_unavailable'));
+  assert.equal(sanitizeErrorForCustomer('OUT_OF_STOCK', 'ar'), t('ar', 'error_product_unavailable'));
+  // Raw JSON containing PRODUCT_NOT_FOUND also maps cleanly without leaking supplier JSON
+  const rawPandoraErr = '{"error":{"code":"PRODUCT_NOT_FOUND","message":"The product does not exist or is not API-enabled."}}';
+  assert.equal(sanitizeErrorForCustomer(rawPandoraErr, 'ar'), t('ar', 'error_product_unavailable'));
+  assert.equal(containsProviderLeak(sanitizeErrorForCustomer(rawPandoraErr, 'ar')), false);
+  // Upstream INSUFFICIENT_BALANCE still keeps error_generic
+  assert.equal(sanitizeErrorForCustomer('INSUFFICIENT_BALANCE', 'ar'), t('ar', 'error_generic'));
 
+  // 4. ensureWarningPrefix prevents duplicate ⚠️ ⚠️ icons
+  assert.equal(
+    ensureWarningPrefix(t('ar', 'error_product_unavailable')),
+    '⚠️ هذا المنتج غير متوفر حاليًا، يرجى المحاولة لاحقًا.'
+  );
+  assert.equal(
+    ensureWarningPrefix('⚠️ ⚠️ تعذر إكمال العملية حاليًا'),
+    '⚠️ تعذر إكمال العملية حاليًا'
+  );
+  assert.equal(ensureWarningPrefix('كوبون الخصم غير صالح.'), '⚠️ كوبون الخصم غير صالح.');
 
+  // 5. Sync reconciliation zeroes disappeared offers on full live fetch, but protects against partial pagination failures
+  const storedOffers = [
+    { id: 4, externalProductId: 'prd_gemini_6m', externalVariantId: 'var_standard', stockCount: 209, isActiveAtProvider: true },
+    { id: 1587, externalProductId: 'prd_ipOQEFPmp0rjP1Lk', externalVariantId: '', stockCount: 0, isActiveAtProvider: true },
+  ];
+  const liveFetched = [{ externalProductId: 'prd_ipOQEFPmp0rjP1Lk', externalVariantId: '' }];
+  assert.deepEqual(collectDisappearedProviderOfferIds(storedOffers, liveFetched, false), [4]);
+  assert.deepEqual(collectDisappearedProviderOfferIds(storedOffers, liveFetched, true), []);
+  assert.deepEqual(collectDisappearedProviderOfferIds(storedOffers, [], false), []);
+});
 
+test('51. scrypt password hashing, strength validation, and timing-safe secret checks enforce security boundaries', () => {
+  assert.equal(validatePasswordStrength('123456').ok, false);
+  assert.equal(validatePasswordStrength('password123').ok, false);
+  assert.equal(validatePasswordStrength('short').ok, false);
+  assert.equal(validatePasswordStrength('Raqm#Owner2026!').ok, true);
 
+  const hashA = hashPasswordScrypt('Raqm#Owner2026!');
+  const hashB = hashPasswordScrypt('Raqm#Owner2026!');
+  assert.ok(hashA.startsWith('scrypt$'));
+  assert.notEqual(hashA, hashB); // Unique random 16-byte salt per hash
+  assert.equal(verifyPasswordScrypt('Raqm#Owner2026!', hashA), true);
+  assert.equal(verifyPasswordScrypt('WrongPassword123', hashA), false);
+  assert.equal(verifyPasswordScrypt('Raqm#Owner2026!', null), false);
+  assert.equal(verifyPasswordScrypt('Raqm#Owner2026!', 'invalid-format'), false);
+
+  assert.equal(timingSafeSecretCompare('super-secret-token', 'super-secret-token'), true);
+  assert.equal(timingSafeSecretCompare('super-secret-token', 'super-secret-tokem'), false);
+  assert.equal(timingSafeSecretCompare('short', 'longer-secret'), false);
+});
+
+test('52. Granular RBAC prevents privilege escalation, strips moderators:manage from non-owners, and guards moderator targets', () => {
+  assert.equal(isStaffRole('owner'), true);
+  assert.equal(isStaffRole('admin'), true);
+  assert.equal(isStaffRole('support'), true);
+  assert.equal(isStaffRole('customer'), false);
+
+  // Even if an attacker injects moderators:manage or unknown perms, sanitize strips them
+  const sanitized = sanitizeModeratorPermissionsInput([
+    'orders:manage',
+    'moderators:manage',
+    'unknown:perm',
+    'deposits:approve',
+  ]);
+  assert.deepEqual(sanitized, ['orders:manage', 'deposits:approve']);
+
+  // Owner gets ALL permissions including moderators:manage
+  const ownerPerms = getEffectivePermissions('owner', []);
+  assert.equal(ownerPerms.length, ADMIN_PERMISSION_DEFS.length);
+  assert.equal(hasPermission({ role: 'owner', permissions: [] }, 'moderators:manage'), true);
+  assert.equal(hasPermission({ role: 'owner', permissions: [] }, 'settings:manage'), true);
+
+  // Moderator with explicit permissions only gets those permissions (never moderators:manage)
+  const modPerms = getEffectivePermissions('support', ['orders:manage', 'moderators:manage']);
+  assert.deepEqual(modPerms, ['orders:manage']);
+  assert.equal(
+    hasPermission({ role: 'support', permissions: modPerms }, 'moderators:manage'),
+    false
+  );
+  assert.equal(hasPermission({ role: 'support', permissions: modPerms }, 'orders:manage'), true);
+  assert.equal(hasPermission({ role: 'support', permissions: modPerms }, 'settings:manage'), false);
+  assert.equal(
+    hasAnyPermission({ role: 'support', permissions: modPerms }, ['settings:manage', 'orders:manage']),
+    true
+  );
+
+  // Support fallback preset when no custom permissions set
+  const defaultSupport = getEffectivePermissions('support', null);
+  assert.deepEqual(defaultSupport, DEFAULT_ROLE_PERMISSION_PRESETS.support);
+
+  // Customer gets zero admin permissions regardless of json
+  assert.deepEqual(getEffectivePermissions('customer', ['orders:manage']), []);
+  assert.equal(hasPermission({ role: 'customer', permissions: ['orders:manage'] }, 'orders:manage'), false);
+
+  // Target management guards
+  assert.equal(
+    canManageTargetModerator({ id: 1, role: 'admin' }, { id: 2, role: 'support' }).allowed,
+    false
+  );
+  assert.equal(
+    canManageTargetModerator({ id: 1, role: 'owner' }, { id: 1, role: 'owner' }).allowed,
+    false
+  );
+  assert.equal(
+    canManageTargetModerator({ id: 1, role: 'owner' }, { id: 2, role: 'owner' }).allowed,
+    false
+  );
+  assert.equal(
+    canManageTargetModerator({ id: 1, role: 'owner' }, { id: 5, role: 'support' }).allowed,
+    true
+  );
+});
+
+test('53. Signed HMAC session tokens embed tokenVersion, verify cleanly, and reject tampered payloads', () => {
+  const token = signSessionToken({
+    uid: 'invited:mod_123',
+    userId: 42,
+    email: 'mod@raqm.store',
+    role: 'support',
+    displayName: 'Support Mod',
+    tv: 3,
+  });
+  assert.ok(token.startsWith('raqm.'));
+
+  const verified = verifySessionToken(token);
+  assert.ok(verified);
+  assert.equal(verified.userId, 42);
+  assert.equal(verified.role, 'support');
+  assert.equal(verified.tv, 3);
+
+  // Tampering with signature or payload must fail verification
+  const parts = token.split('.');
+  const tamperedSig = `${parts[0]}.${parts[1]}.${parts[2].slice(0, -2)}xx`;
+  assert.equal(verifySessionToken(tamperedSig), null);
+
+  const fakePayload = Buffer.from(
+    JSON.stringify({
+      uid: 'local:owner-raqm',
+      userId: 1,
+      email: 'owner@raqm.store',
+      role: 'owner',
+      displayName: 'Fake Owner',
+      tv: 1,
+      exp: Date.now() + 60_000,
+    })
+  ).toString('base64url');
+  assert.equal(verifySessionToken(`raqm.${fakePayload}.${parts[2]}`), null);
+});

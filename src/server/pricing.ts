@@ -461,6 +461,44 @@ export function canSafelyFailoverToBackup(attempt: ProviderAttemptResult): boole
   return Boolean(attempt.deterministicFailureCode && safeDeterministicCodes.has(attempt.deterministicFailureCode));
 }
 
+export function classifyProviderAttemptFailureAction(deterministicFailureCode?: string): {
+  zeroStock: boolean;
+  deactivateOffer: boolean;
+  notifyAdminMissingOffer: boolean;
+} {
+  const code = (deterministicFailureCode || '').trim().toUpperCase();
+  if (code === 'PRODUCT_NOT_FOUND') {
+    return { zeroStock: true, deactivateOffer: true, notifyAdminMissingOffer: true };
+  }
+  if (code === 'OUT_OF_STOCK' || code === 'PRODUCT_UNAVAILABLE') {
+    return { zeroStock: true, deactivateOffer: false, notifyAdminMissingOffer: false };
+  }
+  return { zeroStock: false, deactivateOffer: false, notifyAdminMissingOffer: false };
+}
+
+export function collectDisappearedProviderOfferIds(
+  existingRows: Array<{
+    id: number;
+    externalProductId: string;
+    externalVariantId: string | null;
+    stockCount: number;
+    isActiveAtProvider: boolean;
+  }>,
+  fetchedLiveItems: Array<{ externalProductId: string; externalVariantId?: string | null }>,
+  isPartialFetch = false
+): number[] {
+  if (isPartialFetch || fetchedLiveItems.length === 0) return [];
+  const liveKeys = new Set(
+    fetchedLiveItems.map((it) => `${it.externalProductId}::${it.externalVariantId || ''}`)
+  );
+  return existingRows
+    .filter((row) => {
+      const key = `${row.externalProductId}::${row.externalVariantId || ''}`;
+      return !liveKeys.has(key) && (row.stockCount > 0 || row.isActiveAtProvider);
+    })
+    .map((row) => row.id);
+}
+
 export function applyCouponDiscount(
   subtotalRetail: string,
   coupon: {

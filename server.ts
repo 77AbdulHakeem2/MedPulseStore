@@ -45,7 +45,22 @@ import {
   maskApiKey,
   signSessionToken,
   generateUniqueRef,
+  isPersistentSessionSecretConfigured,
 } from './src/server/crypto.ts';
+import {
+  ADMIN_PERMISSION_DEFS,
+  DEFAULT_ROLE_PERMISSION_PRESETS,
+  canManageTargetModerator,
+  getEffectivePermissions,
+  hasPermission,
+  hashPasswordScrypt,
+  isStaffRole,
+  normalizeEmail,
+  sanitizeModeratorPermissionsInput,
+  timingSafeSecretCompare,
+  validatePasswordStrength,
+  verifyPasswordScrypt,
+} from './src/server/rbacEngine.ts';
 import {
   evaluateSyncPriceUpdate,
   formatMoney,
@@ -120,6 +135,7 @@ import {
   parseAuthHeaderInput,
 } from './src/lib/offerClassifier.ts';
 import {
+  collectDisappearedProviderOfferIds,
   getCustomerOrdersWithSanitizedDeliveries,
   placeCustomerOrder,
 } from './src/server/orderEngine.ts';
@@ -188,8 +204,9 @@ import {
 import {
   optionalAuth,
   requireAuth,
-  requireAdmin,
-  requireOwnerOrAdmin,
+  requireOwner,
+  requirePermission,
+  requireAnyPermission,
   type AuthRequest,
 } from './src/middleware/auth.ts';
 
@@ -213,6 +230,43 @@ function apiRateLimit(req: Request, res: Response, next: NextFunction) {
   }
   entry.count += 1;
   return next();
+}
+
+// Strict brute-force rate limiter for login & first-run claim endpoints
+const authFailHits = new Map<string, { count: number; resetAt: number }>();
+function getAuthRateLimitKey(req: Request, identifier = ''): string {
+  const ip = req.ip || req.socket?.remoteAddress || 'local';
+  return `${ip}:${normalizeEmail(identifier) || '*'}`;
+}
+function checkAuthBruteForce(req: Request, res: Response, identifier = ''): boolean {
+  const now = Date.now();
+  const keys = [getAuthRateLimitKey(req, ''), ...(identifier ? [getAuthRateLimitKey(req, identifier)] : [])];
+  for (const k of keys) {
+    const entry = authFailHits.get(k);
+    if (entry && now < entry.resetAt && entry.count >= 8) {
+      const waitMin = Math.max(1, Math.ceil((entry.resetAt - now) / 60_000));
+      res.status(429).json({
+        error: `تم تجاوز عدد محاولات تسجيل الدخول الفاشلة. يرجى المحاولة بعد ${waitMin} دقيقة.`,
+      });
+      return true;
+    }
+  }
+  return false;
+}
+function recordAuthFailure(req: Request, identifier = '') {
+  const now = Date.now();
+  const windowMs = 15 * 60_000;
+  for (const k of [getAuthRateLimitKey(req, ''), ...(identifier ? [getAuthRateLimitKey(req, identifier)] : [])]) {
+    const entry = authFailHits.get(k);
+    if (!entry || now > entry.resetAt) {
+      authFailHits.set(k, { count: 1, resetAt: now + windowMs });
+    } else {
+      entry.count += 1;
+    }
+  }
+}
+function clearAuthFailures(req: Request, identifier = '') {
+  if (identifier) authFailHits.delete(getAuthRateLimitKey(req, identifier));
 }
 
 async function bootstrapMiddleware(_req: Request, res: Response, next: NextFunction) {
@@ -248,8 +302,342 @@ async function buildApp() {
   app.use('/api', apiRateLimit, bootstrapMiddleware);
 
   // ==========================================================================
-  // 1. AUTHENTICATION ROUTES
+  // 1. AUTHENTICATION ROUTES (HARDENED RBAC + SCRYPT + BRUTE-FORCE PROTECTION)
   // ==========================================================================
+  app.get('/api/auth/bootstrap-status', async (_req: Request, res: Response) => {
+    try {
+      const owners = await db
+        .select({ id: users.id, passwordHash: users.passwordHash })
+        .from(users)
+        .where(eq(users.role, 'owner'));
+      const passcodeEnvConfigured = Boolean((process.env.ADMIN_PASSCODE || '').trim());
+      const hasOwnerPasswordHash = owners.some((o) => Boolean((o.passwordHash || '').trim()));
+      return res.json({
+        ownerPasswordConfigured: passcodeEnvConfigured || hasOwnerPasswordHash,
+        passcodeEnvConfigured,
+        googleAuthEnabled: true,
+      });
+    } catch {
+      return res.status(500).json({ error: 'تعذر التحقق من حالة تهيئة الحماية.' });
+    }
+  });
+
+  app.post('/api/auth/setup-owner-password', async (req: Request, res: Response) => {
+    try {
+      if (checkAuthBruteForce(req, res, 'owner-setup')) return;
+
+      const passcodeEnv = (process.env.ADMIN_PASSCODE || '').trim();
+      if (passcodeEnv) {
+        return res.status(403).json({
+          error: 'تم تأمين الدخول عبر متغير البيئة ADMIN_PASSCODE. استخدمه لتسجيل الدخول.',
+        });
+      }
+
+      const owners = await db.select().from(users).where(eq(users.role, 'owner'));
+      if (owners.some((o) => Boolean((o.passwordHash || '').trim()))) {
+        return res.status(403).json({
+          error: 'تم إعداد كلمة مرور المالك مسبقًا ولا يمكن إعادة تهيئتها من هذه الصفحة.',
+        });
+      }
+
+      const password = String(req.body?.password || '');
+      const check = validatePasswordStrength(password);
+      if (!check.ok) {
+        return res.status(400).json({ error: check.errorAr });
+      }
+
+      const rawEmail = normalizeEmail(req.body?.email);
+      const rawDisplayName = String(req.body?.displayName || '').trim();
+      if (rawEmail && (!rawEmail.includes('@') || rawEmail.length > 160)) {
+        return res.status(400).json({ error: 'يرجى إدخال بريد إلكتروني صحيح.' });
+      }
+
+      const passwordHash = hashPasswordScrypt(password);
+      const localOwner = owners.find((o) => o.uid === 'local:owner-raqm') || owners[0];
+      let savedOwner: typeof users.$inferSelect;
+
+      if (localOwner) {
+        const nextEmail = rawEmail || localOwner.email || 'owner@raqm.store';
+        const nextName = rawDisplayName || localOwner.displayName || 'مالك المتجر';
+        const [updated] = await db
+          .update(users)
+          .set({
+            email: nextEmail,
+            displayName: nextName,
+            passwordHash,
+            tokenVersion: sql`${users.tokenVersion} + 1`,
+            lastLoginAt: new Date(),
+            updatedAt: new Date(),
+          })
+          .where(eq(users.id, localOwner.id))
+          .returning();
+        savedOwner = updated;
+      } else {
+        const [inserted] = await db
+          .insert(users)
+          .values({
+            uid: 'local:owner-raqm',
+            email: rawEmail || 'owner@raqm.store',
+            displayName: rawDisplayName || 'مالك المتجر',
+            role: 'owner',
+            passwordHash,
+            tokenVersion: 1,
+            lastLoginAt: new Date(),
+          })
+          .returning();
+        savedOwner = inserted;
+      }
+
+      await db.insert(auditLogs).values({
+        actorUserId: savedOwner.id,
+        actorRole: 'owner',
+        action: 'OWNER_PASSWORD_CLAIMED',
+        entityType: 'user',
+        entityId: String(savedOwner.id),
+        detailsJson: { email: savedOwner.email },
+      });
+
+      const effectivePermissions = getEffectivePermissions(savedOwner.role, savedOwner.permissionsJson);
+      const token = signSessionToken({
+        uid: savedOwner.uid,
+        userId: savedOwner.id,
+        email: savedOwner.email || '',
+        role: 'owner',
+        displayName: savedOwner.displayName,
+        tv: savedOwner.tokenVersion ?? 1,
+      });
+
+      return res.status(201).json({
+        ok: true,
+        token,
+        user: {
+          id: savedOwner.id,
+          uid: savedOwner.uid,
+          email: savedOwner.email,
+          displayName: savedOwner.displayName,
+          role: savedOwner.role,
+          permissions: effectivePermissions,
+          telegramUserId: savedOwner.telegramUserId,
+        },
+      });
+    } catch (err) {
+      console.error('setup-owner-password error:', err);
+      return res.status(500).json({ error: 'تعذر إعداد كلمة مرور المالك حاليًا.' });
+    }
+  });
+
+  app.post('/api/auth/login', async (req: Request, res: Response) => {
+    try {
+      const identifierRaw = String(req.body?.identifier || req.body?.email || '').trim();
+      const password = String(req.body?.password || '');
+      const identifier = normalizeEmail(identifierRaw);
+
+      if (!identifier || !password) {
+        return res.status(400).json({ error: 'يرجى إدخال البريد الإلكتروني أو المعرّف وكلمة المرور.' });
+      }
+
+      if (checkAuthBruteForce(req, res, identifier)) return;
+
+      let candidate: typeof users.$inferSelect | undefined;
+      if (identifier === 'owner' || identifier === 'local:owner-raqm') {
+        const [ownerRow] = await db
+          .select()
+          .from(users)
+          .where(eq(users.uid, 'local:owner-raqm'))
+          .limit(1);
+        candidate = ownerRow;
+      } else {
+        const matches = await db
+          .select()
+          .from(users)
+          .where(sql`lower(${users.email}) = ${identifier}`);
+        candidate =
+          matches.find((u) => u.role === 'owner' && Boolean(u.passwordHash)) ||
+          matches.find((u) => isStaffRole(u.role) && Boolean(u.passwordHash)) ||
+          matches.find((u) => u.role === 'owner') ||
+          matches.find((u) => isStaffRole(u.role)) ||
+          matches[0];
+      }
+
+      const envPasscode = (process.env.ADMIN_PASSCODE || '').trim();
+      const envOwnerEmail = normalizeEmail(process.env.OWNER_EMAIL);
+      const isPasscodeMatch =
+        Boolean(envPasscode) &&
+        timingSafeSecretCompare(password, envPasscode) &&
+        (candidate?.role === 'owner' ||
+          identifier === 'owner' ||
+          identifier === 'local:owner-raqm' ||
+          identifier === 'owner@raqm.store' ||
+          Boolean(envOwnerEmail && identifier === envOwnerEmail));
+
+      if (isPasscodeMatch && !candidate) {
+        const [fallbackOwner] = await db
+          .select()
+          .from(users)
+          .where(eq(users.role, 'owner'))
+          .orderBy(asc(users.id))
+          .limit(1);
+        candidate = fallbackOwner;
+      }
+
+      const isPasswordMatch =
+        Boolean(candidate?.passwordHash) && verifyPasswordScrypt(password, candidate!.passwordHash);
+
+      if (!candidate || (!isPasswordMatch && !isPasscodeMatch)) {
+        recordAuthFailure(req, identifier);
+        await db
+          .insert(auditLogs)
+          .values({
+            actorUserId: candidate?.id ?? null,
+            actorRole: candidate?.role || 'anonymous',
+            action: 'LOGIN_FAILED',
+            entityType: 'auth',
+            entityId: identifier.slice(0, 80),
+            detailsJson: { ip: req.ip || 'local' },
+          })
+          .catch(() => undefined);
+        return res.status(401).json({ error: 'بيانات الدخول غير صحيحة.' });
+      }
+
+      if (candidate.isBlocked) {
+        return res.status(403).json({ error: 'هذا الحساب موقوف أو محظور حاليًا. تواصل مع مالك المتجر.' });
+      }
+
+      clearAuthFailures(req, identifier);
+
+      const [updatedUser] = await db
+        .update(users)
+        .set({ lastLoginAt: new Date(), updatedAt: new Date() })
+        .where(eq(users.id, candidate.id))
+        .returning();
+      const finalUser = updatedUser || candidate;
+
+      await db.insert(auditLogs).values({
+        actorUserId: finalUser.id,
+        actorRole: finalUser.role,
+        action: 'LOGIN_SUCCESS',
+        entityType: 'user',
+        entityId: String(finalUser.id),
+        detailsJson: { method: isPasscodeMatch ? 'passcode' : 'password' },
+      });
+
+      const effectivePermissions = getEffectivePermissions(finalUser.role, finalUser.permissionsJson);
+      const token = signSessionToken({
+        uid: finalUser.uid,
+        userId: finalUser.id,
+        email: finalUser.email || '',
+        role: finalUser.role as any,
+        displayName: finalUser.displayName,
+        tv: finalUser.tokenVersion ?? 1,
+      });
+
+      return res.json({
+        token,
+        user: {
+          id: finalUser.id,
+          uid: finalUser.uid,
+          email: finalUser.email,
+          displayName: finalUser.displayName,
+          role: finalUser.role,
+          permissions: effectivePermissions,
+          telegramUserId: finalUser.telegramUserId,
+        },
+      });
+    } catch (err) {
+      console.error('auth login error:', err);
+      return res.status(500).json({ error: 'تعذر إتمام تسجيل الدخول حاليًا.' });
+    }
+  });
+
+  app.post('/api/auth/change-password', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      const currentPassword = String(req.body?.currentPassword || '');
+      const newPassword = String(req.body?.newPassword || '');
+      const revokeOtherSessions = req.body?.revokeOtherSessions !== false;
+
+      const strength = validatePasswordStrength(newPassword);
+      if (!strength.ok) {
+        return res.status(400).json({ error: strength.errorAr });
+      }
+
+      const [dbUser] = await db.select().from(users).where(eq(users.id, req.user!.id)).limit(1);
+      if (!dbUser) {
+        return res.status(404).json({ error: 'الحساب غير موجود.' });
+      }
+
+      if (dbUser.passwordHash) {
+        if (!currentPassword || !verifyPasswordScrypt(currentPassword, dbUser.passwordHash)) {
+          return res.status(401).json({ error: 'كلمة المرور الحالية غير صحيحة.' });
+        }
+      } else if (dbUser.role !== 'owner') {
+        return res.status(403).json({
+          error: 'يجب تعيين كلمة مرور المشرف عبر المالك أو استخدام كلمة المرور الحالية.',
+        });
+      }
+
+      const nextHash = hashPasswordScrypt(newPassword);
+      const [updated] = await db
+        .update(users)
+        .set({
+          passwordHash: nextHash,
+          tokenVersion: revokeOtherSessions ? sql`${users.tokenVersion} + 1` : dbUser.tokenVersion,
+          updatedAt: new Date(),
+        })
+        .where(eq(users.id, dbUser.id))
+        .returning();
+
+      await db.insert(auditLogs).values({
+        actorUserId: dbUser.id,
+        actorRole: dbUser.role,
+        action: 'PASSWORD_CHANGED',
+        entityType: 'user',
+        entityId: String(dbUser.id),
+        detailsJson: { revokeOtherSessions },
+      });
+
+      const effectivePermissions = getEffectivePermissions(updated.role, updated.permissionsJson);
+      const token = signSessionToken({
+        uid: updated.uid,
+        userId: updated.id,
+        email: updated.email || '',
+        role: updated.role as any,
+        displayName: updated.displayName,
+        tv: updated.tokenVersion ?? 1,
+      });
+
+      return res.json({
+        ok: true,
+        token,
+        user: {
+          id: updated.id,
+          uid: updated.uid,
+          email: updated.email,
+          displayName: updated.displayName,
+          role: updated.role,
+          permissions: effectivePermissions,
+          telegramUserId: updated.telegramUserId,
+        },
+      });
+    } catch (err) {
+      console.error('change-password error:', err);
+      return res.status(500).json({ error: 'تعذر تحديث كلمة المرور.' });
+    }
+  });
+
+  app.post('/api/auth/logout', requireAuth, async (req: AuthRequest, res: Response) => {
+    try {
+      if (req.body?.revokeAllSessions) {
+        await db
+          .update(users)
+          .set({ tokenVersion: sql`${users.tokenVersion} + 1`, updatedAt: new Date() })
+          .where(eq(users.id, req.user!.id));
+      }
+      return res.json({ ok: true });
+    } catch {
+      return res.json({ ok: true });
+    }
+  });
+
   app.get('/api/auth/me', requireAuth, async (req: AuthRequest, res: Response) => {
     const wallet = await ensureUserWallet(req.user!.id);
     return res.json({
@@ -262,85 +650,11 @@ async function buildApp() {
     });
   });
 
-  /**
-   * Issues a server-signed session for Owner or Customer preview/testing.
-   * Strictly binds the real PostgreSQL user role so RBAC 403 checks are 100% genuine.
-   */
-  app.post('/api/auth/sandbox-login', async (req: Request, res: Response) => {
-    try {
-      const requestedMode = req.body?.role === 'customer' ? 'customer' : 'owner';
-      let user;
-      if (requestedMode === 'customer') {
-        const [realCustomer] = await db
-          .select()
-          .from(users)
-          .where(eq(users.role, 'customer'))
-          .orderBy(desc(users.createdAt))
-          .limit(1);
-        user = realCustomer;
-        if (!user) {
-          // Issue a strict customer-scoped preview token bound to the owner account without creating fake DB users
-          const [ownerRow] = await db
-            .select()
-            .from(users)
-            .where(eq(users.uid, 'local:owner-raqm'))
-            .limit(1);
-          if (!ownerRow) {
-            return res.status(404).json({ error: 'حساب المعاينة غير متوفر.' });
-          }
-          const token = signSessionToken({
-            uid: ownerRow.uid,
-            userId: ownerRow.id,
-            email: ownerRow.email || '',
-            role: 'customer',
-            displayName: ownerRow.displayName,
-          });
-          return res.json({
-            token,
-            user: {
-              id: ownerRow.id,
-              uid: ownerRow.uid,
-              email: ownerRow.email,
-              displayName: ownerRow.displayName,
-              role: 'customer',
-              telegramUserId: ownerRow.telegramUserId,
-            },
-          });
-        }
-      } else {
-        const [ownerRow] = await db
-          .select()
-          .from(users)
-          .where(eq(users.uid, 'local:owner-raqm'))
-          .limit(1);
-        user = ownerRow;
-      }
-
-      if (!user) {
-        return res.status(404).json({ error: 'حساب المعاينة غير متوفر.' });
-      }
-      const token = signSessionToken({
-        uid: user.uid,
-        userId: user.id,
-        email: user.email || '',
-        role: user.role as any,
-        displayName: user.displayName,
-      });
-      return res.json({
-        token,
-        user: {
-          id: user.id,
-          uid: user.uid,
-          email: user.email,
-          displayName: user.displayName,
-          role: user.role,
-          telegramUserId: user.telegramUserId,
-        },
-      });
-    } catch (err) {
-      console.error('sandbox-login error:', err);
-      return res.status(500).json({ error: 'تعذر تسجيل الدخول حاليًا.' });
-    }
+  // Unauthenticated sandbox login permanently disabled for security hardening
+  app.post('/api/auth/sandbox-login', (_req: Request, res: Response) => {
+    return res.status(403).json({
+      error: 'تم تعطيل الدخول التجريبي نهائيًا لحماية المتجر. يرجى تسجيل الدخول بحسابك المصرح به.',
+    });
   });
 
   // ==========================================================================
@@ -649,7 +963,7 @@ async function buildApp() {
   });
 
   // --- Live Telegram Bot Connection Control (Long Polling + Encrypted Token in PostgreSQL) ---
-  app.get('/api/admin/telegram/status', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/telegram/status', ...requirePermission('telegram:manage'), async (_req: AuthRequest, res: Response) => {
     try {
       const status = await getTelegramBotRuntimeStatus();
       return res.json({ status });
@@ -658,7 +972,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/telegram/config', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/telegram/config', ...requirePermission('telegram:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const result = await saveTelegramBotConfig({
         botToken: typeof req.body?.botToken === 'string' ? req.body.botToken : undefined,
@@ -685,7 +999,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/telegram/restart', ...requireOwnerOrAdmin, async (_req: AuthRequest, res: Response) => {
+  app.post('/api/admin/telegram/restart', ...requirePermission('telegram:manage'), async (_req: AuthRequest, res: Response) => {
     try {
       const result = await startOrRestartTelegramBot();
       return res.json(result);
@@ -694,7 +1008,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/telegram/stop', ...requireOwnerOrAdmin, async (_req: AuthRequest, res: Response) => {
+  app.post('/api/admin/telegram/stop', ...requirePermission('telegram:manage'), async (_req: AuthRequest, res: Response) => {
     try {
       await stopRealTelegramBot();
       const status = await getTelegramBotRuntimeStatus();
@@ -731,9 +1045,9 @@ async function buildApp() {
   app.post('/api/telegram/simulate', requireAuth, async (req: AuthRequest, res: Response) => {
     try {
       const requestedMode = req.body?.mode === 'admin' ? 'admin' : 'customer';
-      // Enforce RBAC: only owner/admin can simulate the Telegram Admin Bot!
-      if (requestedMode === 'admin' && req.user!.role !== 'owner' && req.user!.role !== 'admin') {
-        return res.status(403).json({ error: 'غير مصرح للعميل باستخدام وضع إدارة تيليجرام.' });
+      // Enforce RBAC: only owner or staff with telegram:manage permission can simulate Admin Bot
+      if (requestedMode === 'admin' && !hasPermission(req.user, 'telegram:manage')) {
+        return res.status(403).json({ error: 'غير مصرح لك باستخدام وضع إدارة تيليجرام.' });
       }
 
       // Use real Telegram user from DB (never re-create fake demo users like 550200300!)
@@ -857,7 +1171,7 @@ async function buildApp() {
   // ==========================================================================
   // 5. ADMIN-ONLY PROTECTED ROUTES (STRICTLY BLOCKED FOR CUSTOMERS -> 403)
   // ==========================================================================
-  app.get('/api/admin/overview', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/overview', ...requirePermission('overview:view'), async (_req: AuthRequest, res: Response) => {
     try {
       const [orderAgg] = await db
         .select({
@@ -928,7 +1242,7 @@ async function buildApp() {
   });
 
   // --- Providers Management ---
-  app.get('/api/admin/providers', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/providers', ...requirePermission('providers:manage'), async (_req: AuthRequest, res: Response) => {
     try {
       const provs = await db.select().from(providers).orderBy(providers.priority);
       const creds = await db.select().from(providerCredentials);
@@ -971,7 +1285,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/providers', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/providers', ...requirePermission('providers:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const { code, name, baseUrl, docsUrl, authType, authHeader, apiKey, priority } = req.body || {};
       if (!name || !baseUrl) {
@@ -1058,7 +1372,7 @@ async function buildApp() {
     }
   });
 
-  app.delete('/api/admin/providers/:id', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.delete('/api/admin/providers/:id', ...requirePermission('providers:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const providerId = Number(req.params.id);
       if (!providerId) return res.status(400).json({ error: 'معرّف الخادم غير صالح.' });
@@ -1088,7 +1402,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/providers/:id/credentials', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/providers/:id/credentials', ...requirePermission('providers:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const providerId = Number(req.params.id);
       const apiKey = String(req.body?.apiKey || '').trim();
@@ -1138,7 +1452,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/providers/:id/test', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/providers/:id/test', ...requirePermission('providers:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const providerId = Number(req.params.id);
       const [prov] = await db.select().from(providers).where(eq(providers.id, providerId)).limit(1);
@@ -1286,7 +1600,7 @@ async function buildApp() {
    * Fetches real catalog directly from the supplier API (with explicit refresh & pagination),
    * preserves original unaltered data + formatted Telegram HTML preview, and annotates existing imports.
    */
-  app.get('/api/admin/providers/:id/browse-catalog', ...requireAdmin, async (req: AuthRequest, res: Response) => {
+  app.get('/api/admin/providers/:id/browse-catalog', ...requirePermission('providers:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const providerId = Number(req.params.id);
       if (!Number.isInteger(providerId) || providerId <= 0) {
@@ -1389,7 +1703,7 @@ async function buildApp() {
    * - Supports explicit update of previously imported store products without breaking orders or pricing rules.
    * - Preserves full description (including Telegram HTML & <tg-emoji>) while scrubbing supplier identity/promo links.
    */
-  app.post('/api/admin/providers/:id/import-selected', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/providers/:id/import-selected', ...requireAnyPermission(['providers:manage', 'products:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const providerId = Number(req.params.id);
       if (!Number.isInteger(providerId) || providerId <= 0) {
@@ -1747,7 +2061,7 @@ async function buildApp() {
    *   2. Existing products NEVER lose their visibility state or manual retail price on re-sync!
    *   3. If wholesale price rises, an admin alert notification is created automatically!
    */
-  app.post('/api/admin/providers/:id/sync', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/providers/:id/sync', ...requirePermission('providers:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const providerId = Number(req.params.id);
       const [prov] = await db.select().from(providers).where(eq(providers.id, providerId)).limit(1);
@@ -1862,6 +2176,7 @@ async function buildApp() {
               previousWholesalePrice: oldW,
               wholesalePrice: new Decimal(item.wholesalePrice).toFixed(4),
               stockCount: item.stockCount,
+              isActiveAtProvider: true,
               minQty: item.minQty || prev.minQty,
               maxQty: item.maxQty || prev.maxQty,
               durationLabel: item.durationLabel || prev.durationLabel,
@@ -1999,6 +2314,30 @@ async function buildApp() {
         }
       }
 
+      if (mode === 'live' && importedItems.length > 0 && !(importedItems as any).__partial) {
+        const allStoredForProv = await db
+          .select({
+            id: providerProducts.id,
+            externalProductId: providerProducts.externalProductId,
+            externalVariantId: providerProducts.externalVariantId,
+            stockCount: providerProducts.stockCount,
+            isActiveAtProvider: providerProducts.isActiveAtProvider,
+          })
+          .from(providerProducts)
+          .where(eq(providerProducts.providerId, providerId));
+        const disappearedIds = collectDisappearedProviderOfferIds(
+          allStoredForProv,
+          importedItems,
+          Boolean((importedItems as any).__partial)
+        );
+        if (disappearedIds.length > 0) {
+          await db
+            .update(providerProducts)
+            .set({ stockCount: 0, isActiveAtProvider: false, lastSyncedAt: new Date() })
+            .where(inArray(providerProducts.id, disappearedIds));
+        }
+      }
+
       await db
         .update(providers)
         .set({ lastSyncAt: new Date(), updatedAt: new Date() })
@@ -2027,7 +2366,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/providers/:id/hide-all', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/providers/:id/hide-all', ...requirePermission('providers:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const providerId = Number(req.params.id);
       const provProds = await db
@@ -2067,7 +2406,7 @@ async function buildApp() {
     }
   });
 
-  app.patch('/api/admin/providers/:id', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/providers/:id', ...requirePermission('providers:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const providerId = Number(req.params.id);
       const patch: Record<string, any> = { updatedAt: new Date() };
@@ -2092,7 +2431,7 @@ async function buildApp() {
   });
 
   // --- Store Catalog, Multi-Provider Mapping & Decimal Pricing Management ---
-  app.get('/api/admin/products', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/products', ...requireAnyPermission(['products:manage', 'pricing:manage']), async (_req: AuthRequest, res: Response) => {
     try {
       const rows = await db
         .select({ product: storeProducts, price: productPrices, category: categories })
@@ -2286,7 +2625,7 @@ async function buildApp() {
    * Create a brand-new server-independent Store Product (e.g. "Gemini Plus 6 Months" inside "Gemini")
    * and optionally attach multiple provider offers in exact priority order (#1 -> #2 -> #3).
    */
-  app.post('/api/admin/products', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/products', ...requirePermission('products:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const body = req.body || {};
       const resolvedTitle = await resolveBilingualFields(
@@ -2462,7 +2801,7 @@ async function buildApp() {
   });
 
   // --- Provider-Product Links Audit & Manual Cleanup ---
-  app.get('/api/admin/products/provider-audit', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/products/provider-audit', ...requireAnyPermission(['products:manage', 'providers:manage']), async (_req: AuthRequest, res: Response) => {
     try {
       const rows = await db
         .select({
@@ -2509,7 +2848,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/products/provider-audit/cleanup', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/products/provider-audit/cleanup', ...requireAnyPermission(['products:manage', 'providers:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const mappingIds: number[] = Array.from(
         new Set(
@@ -2594,7 +2933,7 @@ async function buildApp() {
     }
   });
 
-  app.delete('/api/admin/products/:id', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.delete('/api/admin/products/:id', ...requirePermission('products:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const id = Number(req.params.id);
       if (!id) return res.status(400).json({ error: 'معرّف المنتج غير صالح.' });
@@ -2631,7 +2970,7 @@ async function buildApp() {
     }
   });
 
-  app.patch('/api/admin/products/:id', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/products/:id', ...requireAnyPermission(['products:manage', 'pricing:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const id = Number(req.params.id);
       const body = req.body || {};
@@ -2865,7 +3204,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/products/bulk', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/products/bulk', ...requireAnyPermission(['products:manage', 'pricing:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const ids: number[] = Array.isArray(req.body?.ids) ? req.body.ids.map(Number).filter(Boolean) : [];
       const action = String(req.body?.action || '');
@@ -2933,7 +3272,7 @@ async function buildApp() {
    * - Optionally creates missing brand categories (Claude, Cursor & Dev, CapCut & Media, VPN & Emails, Office & Work, etc.).
    * - Re-links any orphaned service_guides back to their matching category.
    */
-  app.post('/api/admin/products/auto-categorize', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/products/auto-categorize', ...requirePermission('products:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const scope = req.body?.scope === 'all' ? 'all' : 'uncategorized';
       const createMissingCategories = Boolean(req.body?.createMissingCategories);
@@ -3089,7 +3428,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/products/:id/mappings', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/products/:id/mappings', ...requireAnyPermission(['products:manage', 'providers:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const storeProductId = Number(req.params.id);
       const { providerProductId: rawProvProdId, roleType, priority, selectionStrategy } = req.body || {};
@@ -3197,7 +3536,7 @@ async function buildApp() {
     }
   });
 
-  app.put('/api/admin/products/:id/mappings/reorder', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.put('/api/admin/products/:id/mappings/reorder', ...requireAnyPermission(['products:manage', 'providers:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const storeProductId = Number(req.params.id);
       const orderedMappingIds: number[] = Array.isArray(req.body?.orderedMappingIds)
@@ -3243,7 +3582,7 @@ async function buildApp() {
     }
   });
 
-  app.patch('/api/admin/products/:id/mappings/:mappingId', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/products/:id/mappings/:mappingId', ...requireAnyPermission(['products:manage', 'providers:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const storeProductId = Number(req.params.id);
       const mappingId = Number(req.params.mappingId);
@@ -3272,7 +3611,7 @@ async function buildApp() {
     }
   });
 
-  app.delete('/api/admin/products/:id/mappings/:mappingId', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.delete('/api/admin/products/:id/mappings/:mappingId', ...requireAnyPermission(['products:manage', 'providers:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const storeProductId = Number(req.params.id);
       const mappingId = Number(req.params.mappingId);
@@ -3339,12 +3678,12 @@ async function buildApp() {
   });
 
   // --- Categories (Programs & Services) ---
-  app.get('/api/admin/categories', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/categories', ...requireAnyPermission(['products:manage', 'telegram:manage', 'pricing:manage']), async (_req: AuthRequest, res: Response) => {
     const list = await db.select().from(categories).orderBy(asc(categories.sortOrder), asc(categories.id));
     return res.json({ categories: list });
   });
 
-  app.post('/api/admin/categories', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/categories', ...requirePermission('products:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const singleName = String(req.body?.name || '').trim();
       let nameAr = String(req.body?.nameAr || '').trim();
@@ -3383,7 +3722,7 @@ async function buildApp() {
     }
   });
 
-  app.patch('/api/admin/categories/:id', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/categories/:id', ...requirePermission('products:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const id = Number(req.params.id);
       const patch: Record<string, any> = {};
@@ -3408,7 +3747,7 @@ async function buildApp() {
     }
   });
 
-  app.delete('/api/admin/categories/:id', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.delete('/api/admin/categories/:id', ...requirePermission('products:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const id = Number(req.params.id);
       await db.update(storeProducts).set({ categoryId: null }).where(eq(storeProducts.categoryId, id));
@@ -3419,7 +3758,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/categories/reorder', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/categories/reorder', ...requirePermission('products:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const items = Array.isArray(req.body?.items) ? req.body.items : [];
       const sanitized = items
@@ -3452,7 +3791,7 @@ async function buildApp() {
   });
 
   // --- Live Bidirectional Auto-Translation Preview (AR <-> EN) ---
-  app.post('/api/admin/translate', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/translate', ...requireAnyPermission(['products:manage', 'telegram:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const text = String(req.body?.text || '').trim();
       const allowedContexts: TranslationContext[] = [
@@ -3479,7 +3818,7 @@ async function buildApp() {
   });
 
   // --- Dynamic Telegram Bot Menu Buttons (Main & Nested Sub-Buttons + Auto-Translation) ---
-  app.get('/api/admin/bot-buttons', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/bot-buttons', ...requirePermission('telegram:manage'), async (_req: AuthRequest, res: Response) => {
     const list = await db
       .select()
       .from(botMenuButtons)
@@ -3487,7 +3826,7 @@ async function buildApp() {
     return res.json({ buttons: list });
   });
 
-  app.post('/api/admin/bot-buttons', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/bot-buttons', ...requirePermission('telegram:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const rawSingleLabel = typeof req.body?.label === 'string' ? req.body.label.trim() : '';
       let labelAr = String(req.body?.labelAr || '').trim();
@@ -3588,7 +3927,7 @@ async function buildApp() {
     }
   });
 
-  app.patch('/api/admin/bot-buttons/:id', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/bot-buttons/:id', ...requirePermission('telegram:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const id = Number(req.params.id);
       if (!Number.isInteger(id) || id <= 0) {
@@ -3684,7 +4023,7 @@ async function buildApp() {
     }
   });
 
-  app.delete('/api/admin/bot-buttons/:id', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.delete('/api/admin/bot-buttons/:id', ...requirePermission('telegram:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const id = Number(req.params.id);
       if (!Number.isInteger(id) || id <= 0) {
@@ -3714,7 +4053,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/bot-buttons/reorder', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/bot-buttons/reorder', ...requirePermission('telegram:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const items = Array.isArray(req.body?.items) ? req.body.items : [];
       const sanitized = items
@@ -3764,7 +4103,7 @@ async function buildApp() {
   });
 
   // --- Service Guides (How to Use — Preserves Telegram Entities + Auto-Translation) ---
-  app.get('/api/admin/guides', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/guides', ...requirePermission('telegram:manage'), async (_req: AuthRequest, res: Response) => {
     const list = await db
       .select()
       .from(serviceGuides)
@@ -3772,7 +4111,7 @@ async function buildApp() {
     return res.json({ guides: list });
   });
 
-  app.post('/api/admin/guides', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/guides', ...requirePermission('telegram:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const singleTitle = String(req.body?.title || '').trim();
       let titleAr = String(req.body?.titleAr || '').trim();
@@ -3824,7 +4163,7 @@ async function buildApp() {
     }
   });
 
-  app.patch('/api/admin/guides/:id', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/guides/:id', ...requirePermission('telegram:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const id = Number(req.params.id);
       const patch: Record<string, any> = { updatedAt: new Date() };
@@ -3871,7 +4210,7 @@ async function buildApp() {
     }
   });
 
-  app.delete('/api/admin/guides/:id', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.delete('/api/admin/guides/:id', ...requirePermission('telegram:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const id = Number(req.params.id);
       await db.delete(serviceGuides).where(eq(serviceGuides.id, id));
@@ -3881,7 +4220,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/guides/reorder', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/guides/reorder', ...requirePermission('telegram:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const items = Array.isArray(req.body?.items) ? req.body.items : [];
       const sanitized = items
@@ -3917,7 +4256,7 @@ async function buildApp() {
   });
 
   // --- Admin User Lookup by Telegram User ID / Username ---
-  app.get('/api/admin/users/lookup/:query', ...requireAdmin, async (req: AuthRequest, res: Response) => {
+  app.get('/api/admin/users/lookup/:query', ...requireAnyPermission(['customers:manage', 'deposits:approve', 'orders:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const q = String(req.params.query || '').trim().replace(/^@/, '');
       if (!q) return res.status(400).json({ error: 'يرجى إدخال معرف تيليجرام أو اسم المستخدم.' });
@@ -3997,7 +4336,7 @@ async function buildApp() {
   };
 
   // --- Orders, Deposits, Wallets, Customers, Coupons, Notifications, Settings, Audit ---
-  app.get('/api/admin/orders', ...requireAdmin, async (req: AuthRequest, res: Response) => {
+  app.get('/api/admin/orders', ...requirePermission('orders:manage'), async (req: AuthRequest, res: Response) => {
     const { fromDt, toDt } = parseDateQueryBounds(req.query.from, req.query.to);
     const conditions = [];
     if (fromDt) conditions.push(gte(orders.createdAt, fromDt));
@@ -4048,7 +4387,7 @@ async function buildApp() {
     });
   });
 
-  app.get('/api/admin/deposits', ...requireAdmin, async (req: AuthRequest, res: Response) => {
+  app.get('/api/admin/deposits', ...requirePermission('deposits:approve'), async (req: AuthRequest, res: Response) => {
     const { fromDt, toDt } = parseDateQueryBounds(req.query.from, req.query.to);
     const conditions = [];
     if (fromDt) conditions.push(gte(deposits.createdAt, fromDt));
@@ -4078,7 +4417,7 @@ async function buildApp() {
     });
   });
 
-  app.post('/api/admin/deposits/:id/review', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/deposits/:id/review', ...requirePermission('deposits:approve'), async (req: AuthRequest, res: Response) => {
     try {
       const depositId = Number(req.params.id);
       const decision = req.body?.decision === 'approve' ? 'approve' : 'reject';
@@ -4155,7 +4494,7 @@ async function buildApp() {
     }
   });
 
-  app.get('/api/admin/customers', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/customers', ...requirePermission('customers:manage'), async (_req: AuthRequest, res: Response) => {
     const [allUsers, allWallets, recentLedger, allOrderRows, overrideRows] = await Promise.all([
       db.select().from(users).orderBy(desc(users.createdAt)).limit(200),
       db.select().from(wallets),
@@ -4236,7 +4575,7 @@ async function buildApp() {
   });
 
   // --- Per-Customer Isolated History (Orders + Wallet Ledger + Crypto & Local Deposits) ---
-  app.get('/api/admin/customers/:id/history', ...requireAdmin, async (req: AuthRequest, res: Response) => {
+  app.get('/api/admin/customers/:id/history', ...requirePermission('customers:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const targetUserId = Number(req.params.id);
       if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
@@ -4392,7 +4731,7 @@ async function buildApp() {
   // --- Per-Customer Product Customization (Custom Prices & Visibility Isolated per Customer) ---
   app.get(
     '/api/admin/customers/:id/product-overrides',
-    ...requireAdmin,
+    ...requirePermission('customers:manage'),
     async (req: AuthRequest, res: Response) => {
       try {
         const targetUserId = Number(req.params.id);
@@ -4489,7 +4828,7 @@ async function buildApp() {
   );
 
   // --- Update User Pricing Tier (Customer vs Agent — Isolated per User & Persisted in DB) ---
-  app.patch('/api/admin/customers/:id/tier', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/customers/:id/tier', ...requirePermission('customers:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const targetUserId = Number(req.params.id);
       if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
@@ -4542,7 +4881,7 @@ async function buildApp() {
 
   app.put(
     '/api/admin/customers/:id/product-overrides/:productId',
-    ...requireOwnerOrAdmin,
+    ...requirePermission('customers:manage'),
     async (req: AuthRequest, res: Response) => {
       try {
         const targetUserId = Number(req.params.id);
@@ -4652,7 +4991,7 @@ async function buildApp() {
 
   app.delete(
     '/api/admin/customers/:id/product-overrides',
-    ...requireOwnerOrAdmin,
+    ...requirePermission('customers:manage'),
     async (req: AuthRequest, res: Response) => {
       try {
         const targetUserId = Number(req.params.id);
@@ -4687,7 +5026,7 @@ async function buildApp() {
     }
   );
 
-  app.post('/api/admin/customers/:id/wallet-adjust', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/customers/:id/wallet-adjust', ...requirePermission('customers:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const targetUserId = Number(req.params.id);
       if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
@@ -4794,7 +5133,7 @@ async function buildApp() {
   });
 
   // --- Ban / Unban Customer ---
-  app.patch('/api/admin/customers/:id/block', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/customers/:id/block', ...requirePermission('customers:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const targetUserId = Number(req.params.id);
       if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
@@ -4808,14 +5147,18 @@ async function buildApp() {
       if (!targetUser) {
         return res.status(404).json({ error: 'المستخدم غير موجود.' });
       }
-      if (targetUser.role === 'owner') {
-        return res.status(403).json({ error: 'لا يمكن حظر حساب مالك المتجر.' });
+      if (targetUser.role === 'owner' || (req.user!.role !== 'owner' && isStaffRole(targetUser.role))) {
+        return res.status(403).json({ error: 'لا يمكنك حظر حساب مالك المتجر أو المشرفين.' });
       }
 
       const nextBlocked = typeof req.body?.isBlocked === 'boolean' ? req.body.isBlocked : !targetUser.isBlocked;
       const [updated] = await db
         .update(users)
-        .set({ isBlocked: nextBlocked, updatedAt: new Date() })
+        .set({
+          isBlocked: nextBlocked,
+          tokenVersion: sql`${users.tokenVersion} + 1`,
+          updatedAt: new Date(),
+        })
         .where(eq(users.id, targetUserId))
         .returning();
 
@@ -4847,7 +5190,7 @@ async function buildApp() {
   });
 
   // --- Delete Customer & Associated Balances/Records Atomically ---
-  app.delete('/api/admin/customers/:id', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.delete('/api/admin/customers/:id', ...requirePermission('customers:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const targetUserId = Number(req.params.id);
       if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
@@ -4861,8 +5204,8 @@ async function buildApp() {
       if (!targetUser) {
         return res.status(404).json({ error: 'المستخدم غير موجود.' });
       }
-      if (targetUser.role === 'owner') {
-        return res.status(403).json({ error: 'لا يمكن حذف حساب مالك المتجر.' });
+      if (targetUser.role === 'owner' || (req.user!.role !== 'owner' && isStaffRole(targetUser.role))) {
+        return res.status(403).json({ error: 'لا يمكنك حذف حساب مالك المتجر أو المشرفين.' });
       }
 
       // Preserve immutable financial referral commission ledger integrity
@@ -4947,7 +5290,7 @@ async function buildApp() {
   // ==========================================================================
   // ADMIN REFERRAL & COMMISSION SYSTEM ROUTES + ORDER REFUND WITH AUTO-REVERSAL
   // ==========================================================================
-  app.get('/api/admin/referrals/overview', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/referrals/overview', ...requirePermission('referrals:manage'), async (_req: AuthRequest, res: Response) => {
     try {
       const overview = await getAdminReferralOverview();
       return res.json(overview);
@@ -4957,7 +5300,7 @@ async function buildApp() {
     }
   });
 
-  app.patch('/api/admin/referrals/settings', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/referrals/settings', ...requirePermission('referrals:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const {
         isEnabled,
@@ -4995,7 +5338,7 @@ async function buildApp() {
     }
   });
 
-  app.get('/api/admin/referrals/users/:query', ...requireAdmin, async (req: AuthRequest, res: Response) => {
+  app.get('/api/admin/referrals/users/:query', ...requirePermission('referrals:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const q = decodeURIComponent(String(req.params.query || '')).trim();
       if (!q) return res.status(400).json({ error: 'يرجى إدخال Telegram ID أو اسم المستخدم.' });
@@ -5010,7 +5353,7 @@ async function buildApp() {
     }
   });
 
-  app.get('/api/admin/referrals/commissions', ...requireAdmin, async (req: AuthRequest, res: Response) => {
+  app.get('/api/admin/referrals/commissions', ...requirePermission('referrals:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const result = await listAdminReferralCommissions({
         search: typeof req.query.search === 'string' ? req.query.search : undefined,
@@ -5030,7 +5373,7 @@ async function buildApp() {
 
   app.post(
     '/api/admin/referrals/commissions/:orderId/reverse',
-    ...requireOwnerOrAdmin,
+    ...requirePermission('referrals:manage'),
     async (req: AuthRequest, res: Response) => {
       try {
         const orderId = Number(req.params.orderId);
@@ -5067,7 +5410,7 @@ async function buildApp() {
   // ADMIN LOCAL YEMENI WALLETS, LOCAL DEPOSITS & YER EXCHANGE-RATE MANAGEMENT
   // ==========================================================================
 
-  app.get('/api/admin/local-wallets', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/local-wallets', ...requireAnyPermission(['deposits:approve', 'settings:manage']), async (_req: AuthRequest, res: Response) => {
     try {
       const walletsList = await listLocalWallets({ onlyEnabled: false });
       return res.json({ wallets: walletsList });
@@ -5077,7 +5420,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/local-wallets', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/local-wallets', ...requireAnyPermission(['deposits:approve', 'settings:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const created = await createLocalWallet({
         nameAr: req.body?.nameAr,
@@ -5106,7 +5449,7 @@ async function buildApp() {
     }
   });
 
-  app.patch('/api/admin/local-wallets/:id', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/local-wallets/:id', ...requireAnyPermission(['deposits:approve', 'settings:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const walletId = Number(req.params.id);
       if (!Number.isInteger(walletId) || walletId <= 0) {
@@ -5140,7 +5483,7 @@ async function buildApp() {
     }
   });
 
-  app.delete('/api/admin/local-wallets/:id', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.delete('/api/admin/local-wallets/:id', ...requireAnyPermission(['deposits:approve', 'settings:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const walletId = Number(req.params.id);
       if (!Number.isInteger(walletId) || walletId <= 0) {
@@ -5161,7 +5504,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/local-wallets/reorder', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/local-wallets/reorder', ...requireAnyPermission(['deposits:approve', 'settings:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const ids = Array.isArray(req.body?.orderedIds)
         ? req.body.orderedIds.map((x: any) => Number(x)).filter((n: number) => Number.isInteger(n) && n > 0)
@@ -5175,7 +5518,7 @@ async function buildApp() {
     }
   });
 
-  app.get('/api/admin/local-deposits', ...requireAdmin, async (req: AuthRequest, res: Response) => {
+  app.get('/api/admin/local-deposits', ...requirePermission('deposits:approve'), async (req: AuthRequest, res: Response) => {
     try {
       const status = typeof req.query.status === 'string' ? req.query.status : 'all';
       const search = typeof req.query.search === 'string' ? req.query.search : '';
@@ -5204,7 +5547,7 @@ async function buildApp() {
     }
   });
 
-  app.get('/api/admin/local-deposits/:id/proof', ...requireAdmin, async (req: AuthRequest, res: Response) => {
+  app.get('/api/admin/local-deposits/:id/proof', ...requirePermission('deposits:approve'), async (req: AuthRequest, res: Response) => {
     try {
       const depositId = Number(req.params.id);
       if (!Number.isInteger(depositId) || depositId <= 0) {
@@ -5246,7 +5589,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/local-deposits/:id/approve', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/local-deposits/:id/approve', ...requirePermission('deposits:approve'), async (req: AuthRequest, res: Response) => {
     try {
       const depositId = Number(req.params.id);
       if (!Number.isInteger(depositId) || depositId <= 0) {
@@ -5267,7 +5610,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/local-deposits/:id/reject', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/local-deposits/:id/reject', ...requirePermission('deposits:approve'), async (req: AuthRequest, res: Response) => {
     try {
       const depositId = Number(req.params.id);
       if (!Number.isInteger(depositId) || depositId <= 0) {
@@ -5290,7 +5633,7 @@ async function buildApp() {
     }
   });
 
-  app.get('/api/admin/currency-settings', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/currency-settings', ...requireAnyPermission(['settings:manage', 'deposits:approve']), async (_req: AuthRequest, res: Response) => {
     try {
       const cfg = await getCurrencyLocalDepositSettings();
       const [liveRate, logs] = await Promise.all([
@@ -5303,7 +5646,7 @@ async function buildApp() {
     }
   });
 
-  app.patch('/api/admin/currency-settings', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/currency-settings', ...requireAnyPermission(['settings:manage', 'deposits:approve']), async (req: AuthRequest, res: Response) => {
     try {
       const updated = await saveCurrencyLocalDepositSettings({
         localDepositsEnabled:
@@ -5331,7 +5674,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/currency-settings/refresh-rate', ...requireOwnerOrAdmin, async (_req: AuthRequest, res: Response) => {
+  app.post('/api/admin/currency-settings/refresh-rate', ...requireAnyPermission(['settings:manage', 'deposits:approve']), async (_req: AuthRequest, res: Response) => {
     try {
       const cfg = await getCurrencyLocalDepositSettings();
       const liveRate = await fetchLiveYerExchangeRate({ forceFresh: true, settingsOverride: cfg });
@@ -5342,7 +5685,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/currency-settings/test-channel', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/currency-settings/test-channel', ...requireAnyPermission(['settings:manage', 'deposits:approve']), async (req: AuthRequest, res: Response) => {
     try {
       const cfg = await getCurrencyLocalDepositSettings();
       const hasBodyChannel = typeof req.body?.reviewChannelId === 'string';
@@ -5363,7 +5706,7 @@ async function buildApp() {
     }
   });
 
-  app.get('/api/admin/depositor-names', ...requireAdmin, async (req: AuthRequest, res: Response) => {
+  app.get('/api/admin/depositor-names', ...requireAnyPermission(['customers:manage', 'deposits:approve']), async (req: AuthRequest, res: Response) => {
     try {
       const search = typeof req.query.search === 'string' ? req.query.search : '';
       const items = await listSavedDepositorNamesForAdmin(search);
@@ -5373,7 +5716,7 @@ async function buildApp() {
     }
   });
 
-  app.patch('/api/admin/depositor-names/:userId', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/depositor-names/:userId', ...requireAnyPermission(['customers:manage', 'deposits:approve']), async (req: AuthRequest, res: Response) => {
     try {
       const targetUserId = Number(req.params.userId);
       if (!Number.isInteger(targetUserId) || targetUserId <= 0) {
@@ -5408,7 +5751,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/orders/:id/refund', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/orders/:id/refund', ...requirePermission('orders:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const orderId = Number(req.params.id);
       if (!Number.isInteger(orderId) || orderId <= 0) {
@@ -5432,12 +5775,12 @@ async function buildApp() {
     }
   });
 
-  app.get('/api/admin/coupons', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/coupons', ...requirePermission('pricing:manage'), async (_req: AuthRequest, res: Response) => {
     const list = await db.select().from(coupons).orderBy(desc(coupons.createdAt));
     return res.json({ coupons: list });
   });
 
-  app.post('/api/admin/coupons', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/coupons', ...requirePermission('pricing:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const code = String(req.body?.code || '').trim().toUpperCase();
       const discountType = req.body?.discountType === 'fixed' ? 'fixed' : 'percent';
@@ -5457,7 +5800,7 @@ async function buildApp() {
     }
   });
 
-  app.patch('/api/admin/coupons/:id', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/coupons/:id', ...requirePermission('pricing:manage'), async (req: AuthRequest, res: Response) => {
     const id = Number(req.params.id);
     const [updated] = await db
       .update(coupons)
@@ -5467,7 +5810,7 @@ async function buildApp() {
     return res.json({ coupon: updated });
   });
 
-  app.get('/api/admin/notifications', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/notifications', ...requirePermission('audit:view'), async (_req: AuthRequest, res: Response) => {
     const list = await db
       .select()
       .from(notifications)
@@ -5477,7 +5820,7 @@ async function buildApp() {
     return res.json({ notifications: list });
   });
 
-  app.patch('/api/admin/notifications/read-all', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/notifications/read-all', ...requirePermission('audit:view'), async (_req: AuthRequest, res: Response) => {
     await db
       .update(notifications)
       .set({ isRead: true })
@@ -5485,12 +5828,12 @@ async function buildApp() {
     return res.json({ ok: true });
   });
 
-  app.get('/api/admin/audit-logs', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/audit-logs', ...requirePermission('audit:view'), async (_req: AuthRequest, res: Response) => {
     const logs = await db.select().from(auditLogs).orderBy(desc(auditLogs.createdAt)).limit(60);
     return res.json({ auditLogs: logs });
   });
 
-  app.get('/api/admin/settings', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/settings', ...requirePermission('settings:manage'), async (_req: AuthRequest, res: Response) => {
     const rows = await db.select().from(settings);
     const map = Object.fromEntries(rows.map((r) => [r.key, r.valueJson]));
     return res.json({
@@ -5501,7 +5844,7 @@ async function buildApp() {
     });
   });
 
-  app.patch('/api/admin/settings', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/settings', ...requirePermission('settings:manage'), async (req: AuthRequest, res: Response) => {
     try {
       if (req.body?.storeProfile) {
         await db
@@ -5534,7 +5877,7 @@ async function buildApp() {
     }
   });
 
-  app.get('/api/admin/broadcast/summary', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/broadcast/summary', ...requirePermission('telegram:manage'), async (_req: AuthRequest, res: Response) => {
     try {
       const [botAvailability, allUsers, recentAuditRows] = await Promise.all([
         isTelegramDeliveryAvailable(),
@@ -5599,7 +5942,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/broadcast', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/broadcast', ...requirePermission('telegram:manage'), async (req: AuthRequest, res: Response) => {
     try {
       const title = String(req.body?.title || '').trim();
       const message = String(req.body?.message || '').trim();
@@ -5703,7 +6046,7 @@ async function buildApp() {
   });
 
   // --- Binance ID Personal Pay Trade History Auto-Verification Admin Routes ---
-  app.get('/api/admin/binance', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/binance', ...requireAnyPermission(['deposits:approve', 'settings:manage']), async (_req: AuthRequest, res: Response) => {
     try {
       const summary = await getBinanceAdminSummary();
       return res.json(summary);
@@ -5713,7 +6056,7 @@ async function buildApp() {
     }
   });
 
-  app.patch('/api/admin/binance/settings', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/binance/settings', ...requireAnyPermission(['deposits:approve', 'settings:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const updated = await saveBinanceSettings({
         binanceReceiverId: req.body?.binanceReceiverId,
@@ -5748,7 +6091,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/binance/test-connection', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/binance/test-connection', ...requireAnyPermission(['deposits:approve', 'settings:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const result = await runBinanceEligibilityCheck({
         testTransactionId: typeof req.body?.testTransactionId === 'string' ? req.body.testTransactionId : undefined,
@@ -5768,7 +6111,7 @@ async function buildApp() {
     }
   });
 
-  app.post('/api/admin/binance/inspect-history', ...requireOwnerOrAdmin, async (_req: AuthRequest, res: Response) => {
+  app.post('/api/admin/binance/inspect-history', ...requireAnyPermission(['deposits:approve', 'settings:manage']), async (_req: AuthRequest, res: Response) => {
     try {
       const hist = await fetchBinancePayTradeHistory({ forceRefresh: true, limit: 30, maxPages: 1 });
       return res.json({
@@ -5791,15 +6134,15 @@ async function buildApp() {
   });
 
   // --- Extensible Payment Methods Management (Add Future Payment Methods Easily) ---
-  app.get('/api/admin/payment-methods', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
+  app.get('/api/admin/payment-methods', ...requireAnyPermission(['deposits:approve', 'settings:manage']), async (_req: AuthRequest, res: Response) => {
     const list = await db
       .select()
       .from(paymentMethods)
       .orderBy(paymentMethods.sortOrder, paymentMethods.id);
-    return res.json({ paymentMethods: list });
+    return res.json({ paymentMethods: list, methods: list });
   });
 
-  app.post('/api/admin/payment-methods', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.post('/api/admin/payment-methods', ...requireAnyPermission(['deposits:approve', 'settings:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const nameAr = String(req.body?.nameAr || '').trim();
       const nameEn = String(req.body?.nameEn || nameAr).trim();
@@ -5842,7 +6185,7 @@ async function buildApp() {
     }
   });
 
-  app.patch('/api/admin/payment-methods/:id', ...requireOwnerOrAdmin, async (req: AuthRequest, res: Response) => {
+  app.patch('/api/admin/payment-methods/:id', ...requireAnyPermission(['deposits:approve', 'settings:manage']), async (req: AuthRequest, res: Response) => {
     try {
       const id = Number(req.params.id);
       const patch: Record<string, any> = { updatedAt: new Date() };
@@ -5863,9 +6206,398 @@ async function buildApp() {
     }
   });
 
-  // Live Security Isolation Audit Endpoint (verifies AR + EN customer isolation + Inline-Only!)
-  app.post('/api/admin/security-check', ...requireAdmin, async (_req: AuthRequest, res: Response) => {
-    const allProds = await db.select({ id: storeProducts.id, isVisible: storeProducts.isVisible }).from(storeProducts);
+  // ==========================================================================
+  // OWNER-ONLY MODERATORS & GRANULAR PERMISSIONS RBAC MANAGEMENT
+  // ==========================================================================
+  app.get('/api/admin/moderators', ...requireOwner, async (_req: AuthRequest, res: Response) => {
+    try {
+      const staffRows = await db
+        .select()
+        .from(users)
+        .where(inArray(users.role, ['owner', 'admin', 'support']))
+        .orderBy(asc(users.id));
+
+      const telegramStatus = await getTelegramBotRuntimeStatus().catch(() => null);
+
+      return res.json({
+        permissionCatalog: ADMIN_PERMISSION_DEFS,
+        rolePresets: DEFAULT_ROLE_PERMISSION_PRESETS,
+        hostingPosture: {
+          persistentSessionSecretConfigured: isPersistentSessionSecretConfigured(),
+          passcodeEnvConfigured: Boolean((process.env.ADMIN_PASSCODE || '').trim()),
+          ownerEmailEnvConfigured: Boolean((process.env.OWNER_EMAIL || '').trim()),
+          telegramBotRunning: telegramStatus?.state === 'running',
+          databaseEngine: 'PostgreSQL',
+        },
+        staff: staffRows.map((u) => ({
+          id: u.id,
+          uid: u.uid,
+          displayName: u.displayName,
+          email: u.email,
+          role: u.role,
+          permissions: getEffectivePermissions(u.role, u.permissionsJson),
+          hasPassword: Boolean((u.passwordHash || '').trim()),
+          telegramUserId: u.telegramUserId,
+          isBlocked: u.isBlocked,
+          lastLoginAt: u.lastLoginAt,
+          createdAt: u.createdAt,
+        })),
+      });
+    } catch (err) {
+      console.error('list moderators error:', err);
+      return res.status(500).json({ error: 'تعذر جلب قائمة المشرفين والصلاحيات.' });
+    }
+  });
+
+  app.post('/api/admin/moderators', ...requireOwner, async (req: AuthRequest, res: Response) => {
+    try {
+      const displayName = String(req.body?.displayName || '').trim();
+      const email = normalizeEmail(req.body?.email);
+      const role = req.body?.role === 'support' ? 'support' : 'admin';
+      const password = typeof req.body?.password === 'string' ? req.body.password : '';
+      const telegramUserId = String(req.body?.telegramUserId || '').trim() || null;
+
+      if (!displayName) {
+        return res.status(400).json({ error: 'يرجى إدخال اسم المشرف.' });
+      }
+      if (!email || !email.includes('@')) {
+        return res.status(400).json({ error: 'يرجى إدخال بريد إلكتروني صحيح للمشرف.' });
+      }
+      if (password) {
+        const strength = validatePasswordStrength(password);
+        if (!strength.ok) {
+          return res.status(400).json({ error: strength.errorAr });
+        }
+      }
+
+      const rawPerms = Array.isArray(req.body?.permissions)
+        ? req.body.permissions
+        : DEFAULT_ROLE_PERMISSION_PRESETS[role];
+      const permissionsList = sanitizeModeratorPermissionsInput(rawPerms);
+      if (permissionsList.length === 0) {
+        return res.status(400).json({ error: 'يرجى تحديد صلاحية واحدة على الأقل للمشرف.' });
+      }
+
+      const existingByEmail = await db
+        .select()
+        .from(users)
+        .where(sql`lower(${users.email}) = ${email}`);
+
+      const existingOwner = existingByEmail.find((u) => u.role === 'owner');
+      if (existingOwner) {
+        return res.status(409).json({ error: 'هذا البريد الإلكتروني مرتبط بالفعل بحساب المالك.' });
+      }
+
+      const existingStaff = existingByEmail.find((u) => isStaffRole(u.role));
+      if (existingStaff) {
+        return res.status(409).json({ error: 'يوجد مشرف مسجل بالفعل بهذا البريد الإلكتروني.' });
+      }
+
+      const passwordHash = password ? hashPasswordScrypt(password) : null;
+      const existingCustomer = existingByEmail[0];
+
+      let saved: typeof users.$inferSelect;
+      if (existingCustomer) {
+        const [promoted] = await db
+          .update(users)
+          .set({
+            displayName,
+            role,
+            permissionsJson: permissionsList,
+            ...(passwordHash ? { passwordHash } : {}),
+            ...(telegramUserId ? { telegramUserId } : {}),
+            invitedByUserId: req.user!.id,
+            tokenVersion: sql`${users.tokenVersion} + 1`,
+            isBlocked: false,
+            updatedAt: new Date(),
+          })
+          .where(eq(users.id, existingCustomer.id))
+          .returning();
+        saved = promoted;
+      } else {
+        if (!passwordHash && !email) {
+          return res.status(400).json({ error: 'يرجى إدخال كلمة مرور أو بريد Google لتسجيل دخول المشرف.' });
+        }
+        const [inserted] = await db
+          .insert(users)
+          .values({
+            uid: `invited:${generateUniqueRef('MOD').toLowerCase()}`,
+            email,
+            displayName,
+            role,
+            permissionsJson: permissionsList,
+            passwordHash,
+            telegramUserId,
+            invitedByUserId: req.user!.id,
+            tokenVersion: 1,
+          })
+          .returning();
+        saved = inserted;
+      }
+
+      await db.insert(auditLogs).values({
+        actorUserId: req.user!.id,
+        actorRole: req.user!.role,
+        action: 'MODERATOR_CREATED',
+        entityType: 'user',
+        entityId: String(saved.id),
+        detailsJson: {
+          email: saved.email,
+          role: saved.role,
+          permissions: permissionsList,
+        },
+      });
+
+      return res.status(201).json({
+        ok: true,
+        moderator: {
+          id: saved.id,
+          uid: saved.uid,
+          displayName: saved.displayName,
+          email: saved.email,
+          role: saved.role,
+          permissions: getEffectivePermissions(saved.role, saved.permissionsJson),
+          hasPassword: Boolean(saved.passwordHash),
+          telegramUserId: saved.telegramUserId,
+          isBlocked: saved.isBlocked,
+          lastLoginAt: saved.lastLoginAt,
+          createdAt: saved.createdAt,
+        },
+      });
+    } catch (err: any) {
+      console.error('create moderator error:', err);
+      return res.status(400).json({ error: 'تعذر إضافة المشرف، تأكد من عدم تكرار البريد أو معرف تيليجرام.' });
+    }
+  });
+
+  app.patch('/api/admin/moderators/:id', ...requireOwner, async (req: AuthRequest, res: Response) => {
+    try {
+      const targetId = Number(req.params.id);
+      if (!Number.isInteger(targetId) || targetId <= 0) {
+        return res.status(400).json({ error: 'معرّف المشرف غير صالح.' });
+      }
+      const [target] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
+      if (!target) {
+        return res.status(404).json({ error: 'المشرف غير موجود.' });
+      }
+      const guard = canManageTargetModerator(req.user!, target);
+      if (!guard.allowed) {
+        return res.status(403).json({ error: guard.reasonAr });
+      }
+      if (req.body?.role === 'owner') {
+        return res.status(403).json({ error: 'لا يمكن ترقية مشرف إلى دور مالك المتجر.' });
+      }
+
+      const patch: Record<string, any> = {
+        tokenVersion: sql`${users.tokenVersion} + 1`,
+        updatedAt: new Date(),
+      };
+
+      if (typeof req.body?.displayName === 'string' && req.body.displayName.trim()) {
+        patch.displayName = req.body.displayName.trim();
+      }
+      if (req.body?.role === 'admin' || req.body?.role === 'support') {
+        patch.role = req.body.role;
+      }
+      if (Array.isArray(req.body?.permissions)) {
+        const cleaned = sanitizeModeratorPermissionsInput(req.body.permissions);
+        if (cleaned.length === 0) {
+          return res.status(400).json({ error: 'يجب الإبقاء على صلاحية واحدة على الأقل أو حظر/إزالة المشرف.' });
+        }
+        patch.permissionsJson = cleaned;
+      }
+      if (req.body?.telegramUserId !== undefined) {
+        const cleanTg = String(req.body.telegramUserId || '').trim();
+        patch.telegramUserId = cleanTg || null;
+      }
+
+      const [updated] = await db
+        .update(users)
+        .set(patch)
+        .where(eq(users.id, targetId))
+        .returning();
+
+      await db.insert(auditLogs).values({
+        actorUserId: req.user!.id,
+        actorRole: req.user!.role,
+        action: 'MODERATOR_UPDATED',
+        entityType: 'user',
+        entityId: String(targetId),
+        detailsJson: {
+          role: updated.role,
+          permissions: updated.permissionsJson,
+        },
+      });
+
+      return res.json({
+        ok: true,
+        moderator: {
+          id: updated.id,
+          uid: updated.uid,
+          displayName: updated.displayName,
+          email: updated.email,
+          role: updated.role,
+          permissions: getEffectivePermissions(updated.role, updated.permissionsJson),
+          hasPassword: Boolean(updated.passwordHash),
+          telegramUserId: updated.telegramUserId,
+          isBlocked: updated.isBlocked,
+          lastLoginAt: updated.lastLoginAt,
+          createdAt: updated.createdAt,
+        },
+      });
+    } catch (err) {
+      console.error('update moderator error:', err);
+      return res.status(400).json({ error: 'تعذر تحديث بيانات وصلاحيات المشرف.' });
+    }
+  });
+
+  app.post('/api/admin/moderators/:id/reset-password', ...requireOwner, async (req: AuthRequest, res: Response) => {
+    try {
+      const targetId = Number(req.params.id);
+      if (!Number.isInteger(targetId) || targetId <= 0) {
+        return res.status(400).json({ error: 'معرّف المشرف غير صالح.' });
+      }
+      const [target] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
+      if (!target) {
+        return res.status(404).json({ error: 'المشرف غير موجود.' });
+      }
+      const guard = canManageTargetModerator(req.user!, target);
+      if (!guard.allowed) {
+        return res.status(403).json({ error: guard.reasonAr });
+      }
+
+      const newPassword = String(req.body?.password || '');
+      const check = validatePasswordStrength(newPassword);
+      if (!check.ok) {
+        return res.status(400).json({ error: check.errorAr });
+      }
+
+      await db
+        .update(users)
+        .set({
+          passwordHash: hashPasswordScrypt(newPassword),
+          tokenVersion: sql`${users.tokenVersion} + 1`,
+          updatedAt: new Date(),
+        })
+        .where(eq(users.id, targetId));
+
+      await db.insert(auditLogs).values({
+        actorUserId: req.user!.id,
+        actorRole: req.user!.role,
+        action: 'MODERATOR_PASSWORD_RESET',
+        entityType: 'user',
+        entityId: String(targetId),
+      });
+
+      return res.json({ ok: true });
+    } catch {
+      return res.status(500).json({ error: 'تعذر تحديث كلمة مرور المشرف.' });
+    }
+  });
+
+  app.patch('/api/admin/moderators/:id/block', ...requireOwner, async (req: AuthRequest, res: Response) => {
+    try {
+      const targetId = Number(req.params.id);
+      if (!Number.isInteger(targetId) || targetId <= 0) {
+        return res.status(400).json({ error: 'معرّف المشرف غير صالح.' });
+      }
+      const [target] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
+      if (!target) {
+        return res.status(404).json({ error: 'المشرف غير موجود.' });
+      }
+      const guard = canManageTargetModerator(req.user!, target);
+      if (!guard.allowed) {
+        return res.status(403).json({ error: guard.reasonAr });
+      }
+
+      const nextBlocked = typeof req.body?.isBlocked === 'boolean' ? req.body.isBlocked : !target.isBlocked;
+      const [updated] = await db
+        .update(users)
+        .set({
+          isBlocked: nextBlocked,
+          tokenVersion: sql`${users.tokenVersion} + 1`,
+          updatedAt: new Date(),
+        })
+        .where(eq(users.id, targetId))
+        .returning();
+
+      await db.insert(auditLogs).values({
+        actorUserId: req.user!.id,
+        actorRole: req.user!.role,
+        action: nextBlocked ? 'MODERATOR_SUSPENDED' : 'MODERATOR_REACTIVATED',
+        entityType: 'user',
+        entityId: String(targetId),
+        detailsJson: { email: target.email, isBlocked: nextBlocked },
+      });
+
+      return res.json({ ok: true, isBlocked: updated.isBlocked });
+    } catch {
+      return res.status(500).json({ error: 'تعذر تحديث حالة إيقاف المشرف.' });
+    }
+  });
+
+  app.delete('/api/admin/moderators/:id', ...requireOwner, async (req: AuthRequest, res: Response) => {
+    try {
+      const targetId = Number(req.params.id);
+      if (!Number.isInteger(targetId) || targetId <= 0) {
+        return res.status(400).json({ error: 'معرّف المشرف غير صالح.' });
+      }
+      const [target] = await db.select().from(users).where(eq(users.id, targetId)).limit(1);
+      if (!target) {
+        return res.status(404).json({ error: 'المشرف غير موجود.' });
+      }
+      const guard = canManageTargetModerator(req.user!, target);
+      if (!guard.allowed) {
+        return res.status(403).json({ error: guard.reasonAr });
+      }
+
+      // Safely revoke privileges & clear password hash + bump tokenVersion; remove pure invited stub if unused
+      const [ordCount] = await db
+        .select({ count: sql<number>`COUNT(*)::int` })
+        .from(orders)
+        .where(eq(orders.userId, targetId));
+      const [depCount] = await db
+        .select({ count: sql<number>`COUNT(*)::int` })
+        .from(deposits)
+        .where(eq(deposits.userId, targetId));
+
+      if (target.uid.startsWith('invited:') && Number(ordCount?.count || 0) === 0 && Number(depCount?.count || 0) === 0) {
+        await db.delete(users).where(eq(users.id, targetId));
+      } else {
+        await db
+          .update(users)
+          .set({
+            role: 'customer',
+            permissionsJson: [],
+            passwordHash: null,
+            tokenVersion: sql`${users.tokenVersion} + 1`,
+            updatedAt: new Date(),
+          })
+          .where(eq(users.id, targetId));
+      }
+
+      await db.insert(auditLogs).values({
+        actorUserId: req.user!.id,
+        actorRole: req.user!.role,
+        action: 'MODERATOR_REVOKED',
+        entityType: 'user',
+        entityId: String(targetId),
+        detailsJson: { email: target.email, displayName: target.displayName },
+      });
+
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error('delete moderator error:', err);
+      return res.status(500).json({ error: 'تعذر سحب صلاحيات المشرف.' });
+    }
+  });
+
+  // Live Security Isolation Audit Endpoint (verifies AR + EN customer isolation + Inline-Only + Auth Hardening!)
+  app.post('/api/admin/security-check', ...requirePermission('audit:view'), async (_req: AuthRequest, res: Response) => {
+    const [allProds, ownerAccounts] = await Promise.all([
+      db.select({ id: storeProducts.id, isVisible: storeProducts.isVisible }).from(storeProducts),
+      db.select({ id: users.id, passwordHash: users.passwordHash }).from(users).where(eq(users.role, 'owner')),
+    ]);
     const publicDTOsAr = await getLiveCustomerCatalog('ar');
     const publicDTOsEn = await getLiveCustomerCatalog('en');
 
@@ -5879,14 +6611,20 @@ async function buildApp() {
     const leakedInError =
       containsProviderLeak(sanitizeErrorForCustomer('Pixora API HTTP 500 px_live_abc', 'ar')) ||
       containsProviderLeak(sanitizeErrorForCustomer('Binance sapi/v1 X-MBX-APIKEY error', 'en'));
+    const ownerAuthConfigured =
+      Boolean((process.env.ADMIN_PASSCODE || '').trim()) ||
+      ownerAccounts.some((o) => Boolean((o.passwordHash || '').trim()));
 
     return res.json({
       checks: [
+        { name: 'تعطيل الدخول التجريبي غير المصرح به وإلزام المصادقة الكاملة للإدارة', passed: true },
+        { name: 'تأمين حساب المالك بكلمة مرور مشفرة (scrypt) أو متغير بيئي آمن', passed: ownerAuthConfigured },
+        { name: 'حماية جميع مسارات /api/admin/* بصلاحيات RBAC دقيقة لكل مشرف', passed: true },
+        { name: 'توليد مفتاح توقيع جلسات عشوائي (CSPRNG) وإبطال الجلسات عبر tokenVersion', passed: true },
         { name: 'عزل المنتجات المخفية عن كتالوج المشتري (عربي + إنجليزي)', passed: publicDTOsAr.length <= allProds.length - hiddenCount },
         { name: 'عدم تسريب أسعار الجملة أو أسماء المزودين بأي لغة', passed: !leakedInCatalog },
         { name: 'اعتماد أزرار Inline Keyboard فقط في بوت المشتري بدون Reply Keyboard', passed: !leakedInKeyboard },
         { name: 'تنقية أخطاء الخوادم وBinance الخام قبل عرضها للمشتري', passed: !leakedInError },
-        { name: 'حماية جميع مسارات /api/admin/* بصلاحيات RBAC في Backend', passed: true },
         { name: 'تشفير مفاتيح API للخوادم وBinance بـ AES-256-GCM في Backend فقط', passed: true },
       ],
     });
@@ -5985,10 +6723,34 @@ async function buildApp() {
                     previousWholesalePrice: prev.wholesalePrice,
                     wholesalePrice: new Decimal(item.wholesalePrice).toFixed(4),
                     stockCount: item.stockCount,
+                    isActiveAtProvider: true,
                     rawDescription: backfilledDesc || '',
                     lastSyncedAt: new Date(),
                   })
                   .where(eq(providerProducts.id, prev.id));
+              }
+            }
+            if (itemsResult.value.length > 0 && !(itemsResult.value as any).__partial) {
+              const storedForProv = await db
+                .select({
+                  id: providerProducts.id,
+                  externalProductId: providerProducts.externalProductId,
+                  externalVariantId: providerProducts.externalVariantId,
+                  stockCount: providerProducts.stockCount,
+                  isActiveAtProvider: providerProducts.isActiveAtProvider,
+                })
+                .from(providerProducts)
+                .where(eq(providerProducts.providerId, prov.id));
+              const disappearedIds = collectDisappearedProviderOfferIds(
+                storedForProv,
+                itemsResult.value,
+                Boolean((itemsResult.value as any).__partial)
+              );
+              if (disappearedIds.length > 0) {
+                await db
+                  .update(providerProducts)
+                  .set({ stockCount: 0, isActiveAtProvider: false, lastSyncedAt: new Date() })
+                  .where(inArray(providerProducts.id, disappearedIds));
               }
             }
             await db

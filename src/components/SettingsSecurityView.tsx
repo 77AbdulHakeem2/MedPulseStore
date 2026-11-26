@@ -7,8 +7,9 @@ import {
   Eye,
   ScrollText,
   RefreshCw,
+  KeyRound,
 } from 'lucide-react';
-import { apiFetch } from '../lib/api';
+import { apiFetch, setAuthToken, type SessionUser } from '../lib/api';
 import BinancePayAdminPanel, {
   type BinanceAdminData,
   type PaymentMethodItem,
@@ -30,8 +31,12 @@ interface SettingsSecurityViewProps {
   auditLogs: any[];
   binanceData: BinanceAdminData | null;
   paymentMethods: PaymentMethodItem[];
+  canManageSettings?: boolean;
+  canManagePayments?: boolean;
+  canViewAudit?: boolean;
   onPreviewCustomerBot: (lang: 'ar' | 'en') => void;
   onRefresh: () => Promise<void>;
+  onUserUpdated?: (user: SessionUser) => void;
 }
 
 const ALERT_LABELS: Record<string, string> = {
@@ -56,15 +61,28 @@ export default function SettingsSecurityView({
   auditLogs,
   binanceData,
   paymentMethods,
+  canManageSettings = true,
+  canManagePayments = true,
+  canViewAudit = true,
   onPreviewCustomerBot,
   onRefresh,
+  onUserUpdated,
 }: SettingsSecurityViewProps) {
-  const [activeTab, setActiveTab] = useState<SettingsTab>('binance');
+  const defaultTab: SettingsTab = canManagePayments
+    ? 'binance'
+    : canManageSettings
+      ? 'languages'
+      : 'security';
+  const [activeTab, setActiveTab] = useState<SettingsTab>(defaultTab);
   const [profile, setProfile] = useState<Record<string, any>>(storeProfile);
   const [prefs, setPrefs] = useState<Record<string, boolean>>(notificationPrefs);
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [securityChecks, setSecurityChecks] = useState<Array<{ name: string; passed: boolean }> | null>(null);
   const [busy, setBusy] = useState(false);
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmNewPassword, setConfirmNewPassword] = useState('');
+  const [revokeOtherSessions, setRevokeOtherSessions] = useState(true);
 
   useEffect(() => {
     setProfile(storeProfile);
@@ -131,9 +149,53 @@ export default function SettingsSecurityView({
     await onRefresh();
   };
 
+  const handleChangeOwnPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (newPassword !== confirmNewPassword) {
+      setFeedback({ type: 'err', text: 'كلمة المرور الجديدة وتأكيدها غير متطابقتين.' });
+      return;
+    }
+    setBusy(true);
+    setFeedback(null);
+    try {
+      const res = await apiFetch<{ ok: boolean; token: string; user: SessionUser }>(
+        '/api/auth/change-password',
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            currentPassword,
+            newPassword,
+            revokeOtherSessions,
+          }),
+        }
+      );
+      if (res.token) setAuthToken(res.token);
+      if (res.user && onUserUpdated) onUserUpdated(res.user);
+      setCurrentPassword('');
+      setNewPassword('');
+      setConfirmNewPassword('');
+      setFeedback({
+        type: 'ok',
+        text: revokeOtherSessions
+          ? 'تم تحديث كلمة المرور وإبطال جميع الجلسات الأخرى بنجاح.'
+          : 'تم تحديث كلمة المرور بنجاح.',
+      });
+    } catch (err: any) {
+      setFeedback({ type: 'err', text: err?.message || 'تعذر تحديث كلمة المرور.' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const unreadNotifications = notifications.filter((n) => !n.isRead).length;
   const failedChecksCount = securityChecks ? securityChecks.filter((c) => !c.passed).length : 0;
   const passedChecksCount = securityChecks ? securityChecks.filter((c) => c.passed).length : 0;
+
+  const visibleTabs = [
+    ...(canManagePayments ? [{ id: 'binance' as const, label: 'Binance ID والدفع', icon: Wallet }] : []),
+    ...(canManageSettings ? [{ id: 'languages' as const, label: 'اللغات والمتجر', icon: Globe }] : []),
+    ...(canViewAudit ? [{ id: 'security' as const, label: 'الأمان والتدقيق', icon: ShieldCheck }] : []),
+  ];
 
   return (
     <div className="space-y-6">
@@ -144,11 +206,7 @@ export default function SettingsSecurityView({
           <SegmentedTabs
             value={activeTab}
             onChange={setActiveTab}
-            items={[
-              { id: 'binance', label: 'Binance ID والدفع', icon: Wallet },
-              { id: 'languages', label: 'اللغات والمتجر', icon: Globe },
-              { id: 'security', label: 'الأمان والتدقيق', icon: ShieldCheck },
-            ]}
+            items={visibleTabs}
           />
         }
       />
@@ -468,6 +526,77 @@ export default function SettingsSecurityView({
                 </div>
               )}
             </div>
+          </SurfacePanel>
+
+          <SurfacePanel className="overflow-hidden">
+            <SectionHeader
+              title="تغيير كلمة مرور الحساب وإبطال الجلسات"
+              subtitle="تحديث كلمة المرور المشفرة بـ scrypt مع إمكانية إنهاء جميع الجلسات المفتوحة على الأجهزة الأخرى"
+              icon={KeyRound}
+            />
+            <form onSubmit={handleChangeOwnPassword} className="p-5 space-y-4">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    كلمة المرور الحالية
+                  </label>
+                  <input
+                    type="password"
+                    dir="ltr"
+                    value={currentPassword}
+                    onChange={(e) => setCurrentPassword(e.target.value)}
+                    placeholder="اتركه فارغًا إذا لم تُعيّن مسبقًا (للمالك)"
+                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm focus:border-emerald-600 focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    كلمة المرور الجديدة (8 أحرف على الأقل)
+                  </label>
+                  <input
+                    type="password"
+                    required
+                    minLength={8}
+                    dir="ltr"
+                    value={newPassword}
+                    onChange={(e) => setNewPassword(e.target.value)}
+                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm focus:border-emerald-600 focus:outline-none"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    تأكيد كلمة المرور الجديدة
+                  </label>
+                  <input
+                    type="password"
+                    required
+                    minLength={8}
+                    dir="ltr"
+                    value={confirmNewPassword}
+                    onChange={(e) => setConfirmNewPassword(e.target.value)}
+                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm focus:border-emerald-600 focus:outline-none"
+                  />
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                <label className="inline-flex items-center gap-2 text-xs font-semibold text-slate-700 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={revokeOtherSessions}
+                    onChange={(e) => setRevokeOtherSessions(e.target.checked)}
+                    className="h-4 w-4 accent-emerald-700"
+                  />
+                  إبطال جميع الجلسات الأخرى فور التحديث (تدوير tokenVersion)
+                </label>
+                <button
+                  type="submit"
+                  disabled={busy}
+                  className="rounded-xl bg-slate-900 px-4 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50"
+                >
+                  تحديث كلمة المرور
+                </button>
+              </div>
+            </form>
           </SurfacePanel>
 
           <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">

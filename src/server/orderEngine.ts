@@ -22,6 +22,8 @@ import { decryptSecret, encryptSecret, generateUniqueRef } from './crypto.ts';
 import {
   applyCouponDiscount,
   canSafelyFailoverToBackup,
+  classifyProviderAttemptFailureAction,
+  collectDisappearedProviderOfferIds,
   computeProfitBreakdown,
   rankEligibleProviders,
   selectOptimalProvider,
@@ -58,6 +60,8 @@ export function registerOrderTelegramNotifier(
   orderTelegramNotifier = fn;
 }
 
+export { classifyProviderAttemptFailureAction, collectDisappearedProviderOfferIds };
+
 export interface PlaceStoreOrderInput {
   userId: number;
   storeProductId: number;
@@ -93,8 +97,20 @@ export async function placeCustomerOrder(input: PlaceStoreOrderInput): Promise<P
   const qty = Math.max(1, Math.min(1000, Math.floor(input.quantity || 1)));
   const storeProfile = await getStoreProfile();
 
+  const [buyerRow] = await db
+    .select({
+      preferredCurrency: users.preferredCurrency,
+      languageCode: users.languageCode,
+      pricingTier: users.pricingTier,
+    })
+    .from(users)
+    .where(eq(users.id, input.userId))
+    .limit(1);
+  const buyerLang = buyerRow?.languageCode === 'en' ? 'en' : 'ar';
+  const buyerPricingTier = normalizeUserPricingTier(buyerRow?.pricingTier);
+
   if (storeProfile.isStoreOpen === false) {
-    return { ok: false, customerErrorAr: sanitizeErrorForCustomer('STORE_MAINTENANCE') };
+    return { ok: false, customerErrorAr: sanitizeErrorForCustomer('STORE_MAINTENANCE', buyerLang) };
   }
 
   // 1. Idempotency check: never purchase twice for the same idempotencyKey!
@@ -107,7 +123,7 @@ export async function placeCustomerOrder(input: PlaceStoreOrderInput): Promise<P
   if (existingOrder.length > 0) {
     const ord = existingOrder[0];
     if (ord.userId !== input.userId) {
-      return { ok: false, customerErrorAr: sanitizeErrorForCustomer('UNAUTHORIZED_ORDER_ACCESS') };
+      return { ok: false, customerErrorAr: sanitizeErrorForCustomer('UNAUTHORIZED_ORDER_ACCESS', buyerLang) };
     }
     const deliv = await db.select().from(deliveries).where(eq(deliveries.orderId, ord.id)).limit(1);
     const items = deliv[0] ? (JSON.parse(decryptSecret(deliv[0].encryptedPayload)) as string[]) : [];
@@ -130,7 +146,7 @@ export async function placeCustomerOrder(input: PlaceStoreOrderInput): Promise<P
     .limit(1);
 
   if (!prod || !prod.isVisible || prod.isPaused) {
-    return { ok: false, customerErrorAr: sanitizeErrorForCustomer('PRODUCT_UNAVAILABLE_CUSTOMER') };
+    return { ok: false, customerErrorAr: sanitizeErrorForCustomer('PRODUCT_UNAVAILABLE_CUSTOMER', buyerLang) };
   }
 
   const [priceRule] = await db
@@ -140,7 +156,7 @@ export async function placeCustomerOrder(input: PlaceStoreOrderInput): Promise<P
     .limit(1);
 
   if (!priceRule) {
-    return { ok: false, customerErrorAr: sanitizeErrorForCustomer('PRODUCT_UNAVAILABLE_CUSTOMER') };
+    return { ok: false, customerErrorAr: sanitizeErrorForCustomer('PRODUCT_UNAVAILABLE_CUSTOMER', buyerLang) };
   }
 
   // 2b. Per-customer product visibility & custom price override (strictly isolated to input.userId)
@@ -159,7 +175,7 @@ export async function placeCustomerOrder(input: PlaceStoreOrderInput): Promise<P
     .limit(1);
 
   if (customerOverride?.isHidden) {
-    return { ok: false, customerErrorAr: sanitizeErrorForCustomer('PRODUCT_UNAVAILABLE_CUSTOMER') };
+    return { ok: false, customerErrorAr: sanitizeErrorForCustomer('PRODUCT_UNAVAILABLE_CUSTOMER', buyerLang) };
   }
 
   // 3. Load candidate provider mappings (Primary + Backup)
@@ -200,20 +216,10 @@ export async function placeCustomerOrder(input: PlaceStoreOrderInput): Promise<P
   const primaryCandidate = selectOptimalProvider(candidates, strategy, qty);
 
   if (!primaryCandidate) {
-    return { ok: false, customerErrorAr: sanitizeErrorForCustomer('OUT_OF_STOCK_CUSTOMER') };
+    return { ok: false, customerErrorAr: sanitizeErrorForCustomer('OUT_OF_STOCK_CUSTOMER', buyerLang) };
   }
 
-  // 4. Load buyer profile (including pricingTier: customer | agent) + resolve effective pricing
-  const [buyerRow] = await db
-    .select({
-      preferredCurrency: users.preferredCurrency,
-      languageCode: users.languageCode,
-      pricingTier: users.pricingTier,
-    })
-    .from(users)
-    .where(eq(users.id, input.userId))
-    .limit(1);
-  const buyerPricingTier = normalizeUserPricingTier(buyerRow?.pricingTier);
+  // 4. Resolve effective buyer pricing (customer override > agent tier > standard retail)
 
   const hasCustomerCustomPrice =
     customerOverride?.customPriceUsd !== null &&
@@ -298,7 +304,6 @@ export async function placeCustomerOrder(input: PlaceStoreOrderInput): Promise<P
   let finalTotalRetail = couponEval.finalTotal;
 
   // 5. Create Internal Order Row (snapshots prices & user display currency/rate at purchase time!)
-  const buyerLang = buyerRow?.languageCode === 'en' ? 'en' : 'ar';
   const buyerCurrency: DisplayCurrency = normalizeDisplayCurrency(buyerRow?.preferredCurrency);
   const currencyCfg = await getCurrencyLocalDepositSettings();
   let buyerExchangeRate: string | null = null;
@@ -420,13 +425,27 @@ export async function placeCustomerOrder(input: PlaceStoreOrderInput): Promise<P
       break;
     }
 
-    // If provider confirmed OUT_OF_STOCK, mark cached stock as 0 so subsequent orders route straight to #2
-    // without touching saved priority order (#1 automatically reclaims priority when stock returns!)
-    if (attempt.deterministicFailureCode === 'OUT_OF_STOCK') {
+    // Auto-zero stale stock on deterministic unavailability (OUT_OF_STOCK, PRODUCT_NOT_FOUND, PRODUCT_UNAVAILABLE)
+    // and deactivate offer if upstream reports PRODUCT_NOT_FOUND so backup providers take over cleanly!
+    const failAction = classifyProviderAttemptFailureAction(attempt.deterministicFailureCode);
+    if (failAction.zeroStock) {
       await db
         .update(providerProducts)
-        .set({ stockCount: 0 })
+        .set({
+          stockCount: 0,
+          lastSyncedAt: new Date(),
+          ...(failAction.deactivateOffer ? { isActiveAtProvider: false } : {}),
+        })
         .where(eq(providerProducts.id, candidate.providerProductId));
+    }
+    if (failAction.notifyAdminMissingOffer) {
+      await db.insert(notifications).values({
+        audience: 'admin',
+        eventType: 'provider_offer_missing',
+        severity: 'warning',
+        titleAr: `عرض معطل لدى ${candidate.providerName} (${prod.titleAr})`,
+        bodyAr: `المزود أبلغ أن المعرف ${candidate.externalProductId} غير موجود أو غير مفعل عبر API (PRODUCT_NOT_FOUND) أثناء الطلب ${orderNumber}. تم تصفير مخزونه تلقائيًا وتجربة المزود الاحتياطي.`,
+      });
     }
 
     // CRITICAL ANTI-DOUBLE-BUY RULE: Never switch to backup if primary outcome is uncertain!
@@ -581,7 +600,9 @@ export async function placeCustomerOrder(input: PlaceStoreOrderInput): Promise<P
     note: `استرجاع تلقائي لفشل تنفيذ الطلب ${orderNumber}`,
   });
 
-  const safeErr = sanitizeErrorForCustomer(finalProviderResult?.rawError || 'PROVIDER_ERROR');
+  const failureReasonInput =
+    finalProviderResult?.deterministicFailureCode || finalProviderResult?.rawError || 'PROVIDER_ERROR';
+  const safeErr = sanitizeErrorForCustomer(failureReasonInput, buyerLang);
   await db
     .update(orders)
     .set({ status: 'refunded', customerMessageAr: safeErr, updatedAt: new Date() })
@@ -592,7 +613,7 @@ export async function placeCustomerOrder(input: PlaceStoreOrderInput): Promise<P
     eventType: 'order_failed',
     severity: 'critical',
     titleAr: `فشل تنفيذ الطلب ${orderNumber} وتمت إعادة الرصيد`,
-    bodyAr: `سبب داخلي: ${finalProviderResult?.deterministicFailureCode || finalProviderResult?.rawError || 'غير معروف'}`,
+    bodyAr: `المزود: ${usedCandidate.providerName} | المعرف: ${usedCandidate.externalProductId} | السبب الداخلي: ${finalProviderResult?.deterministicFailureCode || finalProviderResult?.rawError || 'غير معروف'}`,
   });
 
   await db.insert(auditLogs).values({
@@ -601,7 +622,12 @@ export async function placeCustomerOrder(input: PlaceStoreOrderInput): Promise<P
     action: 'ORDER_FAILED_REFUNDED',
     entityType: 'order',
     entityId: String(createdOrder.id),
-    detailsJson: { orderNumber, code: finalProviderResult?.deterministicFailureCode },
+    detailsJson: {
+      orderNumber,
+      providerCode: usedCandidate.providerCode,
+      externalProductId: usedCandidate.externalProductId,
+      code: finalProviderResult?.deterministicFailureCode,
+    },
   });
 
   return { ok: false, orderNumber, status: 'refunded', customerErrorAr: safeErr };

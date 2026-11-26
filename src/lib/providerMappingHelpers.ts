@@ -1,4 +1,4 @@
-import { classifyOfferBrand } from './offerClassifier';
+import { classifyOfferBrand } from './offerClassifier.ts';
 
 export type MappingIssueType =
   | 'duplicate_offer_across_products'

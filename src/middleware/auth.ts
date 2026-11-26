@@ -1,11 +1,20 @@
-import { Request, Response, NextFunction } from 'express';
-import { eq } from 'drizzle-orm';
+import type { Request, Response, NextFunction } from 'express';
+import { eq, sql } from 'drizzle-orm';
 import { adminAuth } from '../lib/firebase-admin.ts';
 import { verifySessionToken } from '../server/crypto.ts';
 import { db } from '../db/index.ts';
 import { users } from '../db/schema.ts';
+import {
+  getEffectivePermissions,
+  hasAnyPermission,
+  hasPermission,
+  isStaffRole,
+  normalizeEmail,
+  type AdminPermissionKey,
+  type AppUserRole,
+} from '../server/rbacEngine.ts';
 
-export type UserRole = 'owner' | 'admin' | 'support' | 'customer';
+export type UserRole = AppUserRole;
 
 export interface AuthUser {
   id: number;
@@ -13,6 +22,8 @@ export interface AuthUser {
   email: string | null;
   displayName: string;
   role: UserRole;
+  permissions: AdminPermissionKey[];
+  tokenVersion: number;
   telegramUserId?: string | null;
 }
 
@@ -28,51 +39,105 @@ export function hasRoleAccess(userRole: string | undefined, allowedRoles: UserRo
   return allowedRoles.includes(userRole as UserRole);
 }
 
-async function upsertFirebaseUser(uid: string, email: string, name?: string): Promise<AuthUser> {
-  const ownerEmail = (process.env.OWNER_EMAIL || '').trim().toLowerCase();
-  const isConfiguredOwner = ownerEmail && email.toLowerCase() === ownerEmail;
+function toAuthUser(dbRow: typeof users.$inferSelect): AuthUser {
+  const role = (dbRow.role || 'customer') as UserRole;
+  return {
+    id: dbRow.id,
+    uid: dbRow.uid,
+    email: dbRow.email,
+    displayName: dbRow.displayName,
+    role,
+    permissions: getEffectivePermissions(role, dbRow.permissionsJson),
+    tokenVersion: dbRow.tokenVersion ?? 1,
+    telegramUserId: dbRow.telegramUserId,
+  };
+}
 
-  const existing = await db.select().from(users).where(eq(users.uid, uid)).limit(1);
-  if (existing.length > 0) {
-    const u = existing[0];
-    return {
-      id: u.id,
-      uid: u.uid,
-      email: u.email,
-      displayName: u.displayName,
-      role: u.role as UserRole,
-      telegramUserId: u.telegramUserId,
-    };
+async function upsertFirebaseUser(
+  uid: string,
+  rawEmail: string | undefined,
+  emailVerified: boolean,
+  name?: string
+): Promise<AuthUser> {
+  const ownerEmail = normalizeEmail(process.env.OWNER_EMAIL);
+  const email = normalizeEmail(rawEmail);
+  const hasRealEmail = Boolean(email && !email.endsWith('@firebase.local'));
+  const isConfiguredOwner = Boolean(ownerEmail && hasRealEmail && emailVerified && email === ownerEmail);
+
+  // 1. Direct match by Firebase UID
+  const existingByUid = await db.select().from(users).where(eq(users.uid, uid)).limit(1);
+  if (existingByUid.length > 0) {
+    let row = existingByUid[0];
+    if (isConfiguredOwner && row.role !== 'owner') {
+      const [promoted] = await db
+        .update(users)
+        .set({ role: 'owner', updatedAt: new Date() })
+        .where(eq(users.id, row.id))
+        .returning();
+      if (promoted) row = promoted;
+    }
+    return toAuthUser(row);
   }
 
-  // First Firebase user signing in to a fresh workspace becomes owner if no non-demo owner exists,
-  // or if email matches OWNER_EMAIL; otherwise customer by default.
-  const existingOwners = await db.select().from(users).where(eq(users.role, 'owner')).limit(2);
-  const hasRealFirebaseOwner = existingOwners.some((o) => !o.uid.startsWith('local:'));
-  const assignedRole: UserRole = isConfiguredOwner || !hasRealFirebaseOwner ? 'owner' : 'customer';
+  // 2. Pre-invited moderator or pre-configured owner matching VERIFIED email
+  if (hasRealEmail && emailVerified) {
+    const emailMatches = await db
+      .select()
+      .from(users)
+      .where(sql`lower(${users.email}) = ${email}`);
+
+    // Prefer binding an invited/local staff account first
+    const candidate =
+      emailMatches.find((u) => isStaffRole(u.role) && (u.uid.startsWith('invited:') || u.uid.startsWith('local:'))) ||
+      emailMatches.find((u) => u.uid.startsWith('invited:')) ||
+      null;
+
+    if (candidate) {
+      const nextRole: UserRole = isConfiguredOwner ? 'owner' : (candidate.role as UserRole);
+      const [bound] = await db
+        .update(users)
+        .set({
+          uid,
+          email,
+          role: nextRole,
+          displayName: candidate.displayName || name || email.split('@')[0] || 'مستخدم',
+          lastLoginAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .where(eq(users.id, candidate.id))
+        .returning();
+      if (bound) {
+        return toAuthUser(bound);
+      }
+    }
+  }
+
+  // 3. Brand new Firebase user:
+  // ONLY explicit verified OWNER_EMAIL becomes 'owner'; everyone else defaults strictly to 'customer'.
+  // Never auto-promote an arbitrary first Firebase user to 'owner'!
+  const assignedRole: UserRole = isConfiguredOwner ? 'owner' : 'customer';
 
   const [inserted] = await db
     .insert(users)
     .values({
       uid,
-      email,
-      displayName: name || email.split('@')[0] || 'مستخدم',
+      email: hasRealEmail ? email : `${uid}@firebase.local`,
+      displayName: name || (hasRealEmail ? email.split('@')[0] : '') || 'مستخدم',
       role: assignedRole,
+      permissionsJson: [],
+      lastLoginAt: new Date(),
     })
     .onConflictDoUpdate({
       target: users.uid,
-      set: { email, updatedAt: new Date() },
+      set: {
+        email: hasRealEmail ? email : `${uid}@firebase.local`,
+        lastLoginAt: new Date(),
+        updatedAt: new Date(),
+      },
     })
     .returning();
 
-  return {
-    id: inserted.id,
-    uid: inserted.uid,
-    email: inserted.email,
-    displayName: inserted.displayName,
-    role: inserted.role as UserRole,
-    telegramUserId: inserted.telegramUserId,
-  };
+  return toAuthUser(inserted);
 }
 
 export const requireAuth = async (req: AuthRequest, res: Response, next: NextFunction) => {
@@ -83,7 +148,7 @@ export const requireAuth = async (req: AuthRequest, res: Response, next: NextFun
 
   const token = authHeader.slice('Bearer '.length).trim();
 
-  // 1. Check signed session token first (fast HMAC verify)
+  // 1. Check signed server session token first (fast HMAC verify + DB tokenVersion check)
   if (token.startsWith('raqm.')) {
     const payload = verifySessionToken(token);
     if (!payload) {
@@ -94,14 +159,10 @@ export const requireAuth = async (req: AuthRequest, res: Response, next: NextFun
       if (!dbUser || dbUser.isBlocked) {
         return res.status(403).json({ error: 'الحساب غير متاح أو محظور.' });
       }
-      req.user = {
-        id: dbUser.id,
-        uid: dbUser.uid,
-        email: dbUser.email,
-        displayName: dbUser.displayName,
-        role: dbUser.role as UserRole,
-        telegramUserId: dbUser.telegramUserId,
-      };
+      if ((payload.tv ?? 1) !== (dbUser.tokenVersion ?? 1)) {
+        return res.status(401).json({ error: 'تم إنهاء الجلسة بعد تحديث الصلاحيات أو كلمة المرور. يرجى إعادة تسجيل الدخول.' });
+      }
+      req.user = toAuthUser(dbUser);
       return next();
     } catch (err) {
       console.error('Session lookup failed:', err);
@@ -114,10 +175,15 @@ export const requireAuth = async (req: AuthRequest, res: Response, next: NextFun
     const decoded = await adminAuth.verifyIdToken(token);
     const dbUser = await upsertFirebaseUser(
       decoded.uid,
-      decoded.email || `${decoded.uid}@firebase.local`,
+      decoded.email,
+      Boolean(decoded.email_verified),
       decoded.name
     );
-    const [freshRow] = await db.select({ isBlocked: users.isBlocked }).from(users).where(eq(users.id, dbUser.id)).limit(1);
+    const [freshRow] = await db
+      .select({ isBlocked: users.isBlocked })
+      .from(users)
+      .where(eq(users.id, dbUser.id))
+      .limit(1);
     if (freshRow?.isBlocked) {
       return res.status(403).json({ error: 'الحساب محظور حاليًا. يرجى التواصل مع الإدارة.' });
     }
@@ -141,15 +207,8 @@ export const optionalAuth = async (req: AuthRequest, _res: Response, next: NextF
     if (!payload) return next();
     try {
       const [dbUser] = await db.select().from(users).where(eq(users.id, payload.userId)).limit(1);
-      if (dbUser && !dbUser.isBlocked) {
-        req.user = {
-          id: dbUser.id,
-          uid: dbUser.uid,
-          email: dbUser.email,
-          displayName: dbUser.displayName,
-          role: dbUser.role as UserRole,
-          telegramUserId: dbUser.telegramUserId,
-        };
+      if (dbUser && !dbUser.isBlocked && (payload.tv ?? 1) === (dbUser.tokenVersion ?? 1)) {
+        req.user = toAuthUser(dbUser);
       }
     } catch {
       // Ignore optional auth lookup error and fall back to public view
@@ -161,7 +220,8 @@ export const optionalAuth = async (req: AuthRequest, _res: Response, next: NextF
     const decoded = await adminAuth.verifyIdToken(token);
     const dbUser = await upsertFirebaseUser(
       decoded.uid,
-      decoded.email || `${decoded.uid}@firebase.local`,
+      decoded.email,
+      Boolean(decoded.email_verified),
       decoded.name
     );
     const [freshRow] = await db
@@ -192,5 +252,41 @@ export const requireRoles = (allowedRoles: UserRole[]) => {
   };
 };
 
-export const requireAdmin = [requireAuth, requireRoles(['owner', 'admin', 'support'])];
+export const requirePermission = (permission: AdminPermissionKey) => {
+  return [
+    requireAuth,
+    (req: AuthRequest, res: Response, next: NextFunction) => {
+      if (!req.user) {
+        return res.status(401).json({ error: 'يجب تسجيل الدخول أولاً.' });
+      }
+      if (!isStaffRole(req.user.role) || !hasPermission(req.user, permission)) {
+        return res.status(403).json({
+          error: 'ليس لديك الصلاحية اللازمة لتنفيذ هذا الإجراء.',
+        });
+      }
+      return next();
+    },
+  ];
+};
+
+export const requireAnyPermission = (permissionsList: readonly AdminPermissionKey[]) => {
+  return [
+    requireAuth,
+    (req: AuthRequest, res: Response, next: NextFunction) => {
+      if (!req.user) {
+        return res.status(401).json({ error: 'يجب تسجيل الدخول أولاً.' });
+      }
+      if (!isStaffRole(req.user.role) || !hasAnyPermission(req.user, permissionsList)) {
+        return res.status(403).json({
+          error: 'ليس لديك الصلاحية اللازمة للوصول إلى هذا القسم.',
+        });
+      }
+      return next();
+    },
+  ];
+};
+
+export const requireOwner = [requireAuth, requireRoles(['owner'])];
+export const requireStaff = [requireAuth, requireRoles(['owner', 'admin', 'support'])];
+export const requireAdmin = requireStaff;
 export const requireOwnerOrAdmin = [requireAuth, requireRoles(['owner', 'admin'])];

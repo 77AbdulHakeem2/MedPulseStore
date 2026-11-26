@@ -324,6 +324,7 @@ export const pandoraAdapter: ProviderAdapter = {
       const res = await safeFetchJson('pandora', nextDirectUrl, { method: 'GET', headers }, 15_000, 60);
       if (!res.ok || !res.data) {
         if (hop === 0) throw new Error(`Pandora catalog error: HTTP ${res.status}`);
+        Object.defineProperty(allItems, '__partial', { value: true, enumerable: false });
         break;
       }
       const rawList = Array.isArray(res.data) ? res.data : res.data.items || res.data.products || res.data.data || [];
@@ -1174,7 +1175,10 @@ function createConfigurableResellerAdapter(spec: ConfigurableResellerSpec): Prov
               visitedUrls.add(nextUrl);
 
               const nextRes = await safeFetchJson(spec.code, nextUrl, { method: 'GET', headers }, 15_000, limit);
-              if (!nextRes.ok || !nextRes.data) break;
+              if (!nextRes.ok || !nextRes.data) {
+                Object.defineProperty(collected, '__partial', { value: true, enumerable: false });
+                break;
+              }
               const nextRawList = extractRawCatalogItemsList(nextRes.data);
               const nextItems = normalizeGenericCatalogItems(nextRes.data);
               if (nextItems.length === 0) break;

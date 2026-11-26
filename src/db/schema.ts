@@ -48,6 +48,11 @@ export const users = pgTable(
     botStateJson: jsonb('bot_state_json').$type<Record<string, any>>(), // persistent FSM & nav context
     referralCode: text('referral_code').unique(),
     referredByUserId: integer('referred_by_user_id'),
+    passwordHash: text('password_hash'),
+    permissionsJson: jsonb('permissions_json').$type<string[]>(),
+    tokenVersion: integer('token_version').notNull().default(1),
+    invitedByUserId: integer('invited_by_user_id'),
+    lastLoginAt: timestamp('last_login_at'),
     isBlocked: boolean('is_blocked').notNull().default(false),
     createdAt: timestamp('created_at').defaultNow().notNull(),
     updatedAt: timestamp('updated_at').defaultNow().notNull(),
@@ -55,6 +60,7 @@ export const users = pgTable(
   (table) => [
     index('users_role_idx').on(table.role),
     index('users_pricing_tier_idx').on(table.pricingTier),
+    index('users_email_idx').on(table.email),
   ]
 );
 

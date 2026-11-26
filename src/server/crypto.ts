@@ -10,8 +10,15 @@ function getEncryptionKey(): Buffer {
   return crypto.createHash('sha256').update(raw).digest();
 }
 
+const RUNTIME_SESSION_SECRET = crypto.randomBytes(32).toString('hex');
+
 function getSessionSecret(): string {
-  return process.env.SESSION_SIGNING_SECRET || 'raqm-session-signing-secret-change-in-production';
+  const configured = (process.env.SESSION_SIGNING_SECRET || '').trim();
+  return configured || RUNTIME_SESSION_SECRET;
+}
+
+export function isPersistentSessionSecretConfigured(): boolean {
+  return Boolean((process.env.SESSION_SIGNING_SECRET || '').trim());
 }
 
 export function encryptSecret(plaintext: string): string {
@@ -67,12 +74,14 @@ export interface SignedSessionPayload {
   email: string;
   role: 'owner' | 'admin' | 'support' | 'customer';
   displayName: string;
+  tv?: number;
   exp: number;
 }
 
 export function signSessionToken(payload: Omit<SignedSessionPayload, 'exp'>, ttlSeconds = 86400 * 7): string {
   const fullPayload: SignedSessionPayload = {
     ...payload,
+    tv: payload.tv ?? 1,
     exp: Math.floor(Date.now() / 1000) + ttlSeconds,
   };
   const encoded = Buffer.from(JSON.stringify(fullPayload), 'utf8').toString('base64url');
